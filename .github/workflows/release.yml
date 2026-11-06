@@ -1,0 +1,116 @@
+name: Build & Release
+
+# - every push / pull request : build Windows + Linux and run the headless bot match test
+# - pushing a tag "vX.Y.Z"     : additionally publishes a GitHub Release with the zips
+#                                (the launcher picks it up automatically)
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x64
+          - os: ubuntu-22.04
+            platform: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev \
+            libgl1-mesa-dev libasound2-dev libpulse-dev zip
+
+      - name: Version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "AXIOM_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "AXIOM_VERSION=0.0.0-dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAXIOM_VERSION="$AXIOM_VERSION" -DAXIOM_REPO="${{ github.repository }}"
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release --parallel
+
+      - name: Headless bot match (simulation test)
+        shell: bash
+        run: |
+          BIN=build/AxiomSimTest
+          [ -f build/Release/AxiomSimTest.exe ] && BIN=build/Release/AxiomSimTest.exe
+          "$BIN" 2 2 | tail -15
+
+      - name: Package
+        shell: bash
+        run: |
+          OUT=dist/AXIOM
+          mkdir -p "$OUT/game"
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            cp build/Release/AxiomLauncher.exe "$OUT/"
+            cp build/Release/AxiomGame.exe build/Release/AxiomServer.exe "$OUT/game/"
+          else
+            cp build/AxiomLauncher "$OUT/"
+            cp build/AxiomGame build/AxiomServer "$OUT/game/"
+            chmod +x "$OUT/AxiomLauncher" "$OUT/game/AxiomGame" "$OUT/game/AxiomServer"
+          fi
+          echo "$AXIOM_VERSION" > "$OUT/game/version.txt"
+          printf "repo=%s\nclose_on_play=1\n" "${{ github.repository }}" > "$OUT/launcher.ini"
+          cp README.md "$OUT/README.md"
+          cp assets/fonts/OFL.txt "$OUT/game/FONT-LICENSE.txt"
+          cd dist
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            7z a -tzip "../AXIOM-${{ matrix.platform }}.zip" AXIOM > /dev/null
+          else
+            zip -qr "../AXIOM-${{ matrix.platform }}.zip" AXIOM
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AXIOM-${{ matrix.platform }}
+          path: AXIOM-${{ matrix.platform }}.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Release notes
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # take the matching section of CHANGELOG.md if present, otherwise a default text
+          if [ -f CHANGELOG.md ] && grep -q "^## \[$VERSION\]" CHANGELOG.md; then
+            awk -v v="## [$VERSION]" 'index($0,v)==1{f=1;print;next} /^## \[/{if(f)exit} f' CHANGELOG.md > notes.md
+          else
+            echo "## AXIOM $VERSION" > notes.md
+            echo "Mise a jour disponible via le launcher." >> notes.md
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: AXIOM ${{ github.ref_name }}
+          body_path: notes.md
+          files: artifacts/*.zip

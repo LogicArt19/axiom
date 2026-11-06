@@ -1,0 +1,10 @@
+build/
+build-*/
+dist/
+_update/
+*.zip
+config.ini
+career.ini
+launcher.ini
+t_*.png
+l_*.png
