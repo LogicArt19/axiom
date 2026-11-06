@@ -1,13 +1,14 @@
 # Changelog
 
-## [1.0.0]
+## [2.0.0] — AXIOM : Hero Strategy
+Nouveau jeu qui remplace le FPS 1.0 : un mélange StarCraft II / League of Legends.
+- Chaque joueur contrôle un héros (compétences, niveaux, objets) et une armée complète.
+- 4 cartes RTS : bases principales en hauteur avec rampe, naturelles, expansions, bases riches,
+  crêtes et lacs ; les départs ne sont plus dans les coins.
+- Deux ressources : cristaux (gisements épuisables) et flux (Extracteur), Centre d'expansion.
+- Vision en hauteur, phares de vision, camps neutres, Titan.
+- 1v1 / 2v2 / 3v3 contre l'IA (5 niveaux) ou en ligne, serveur dédié avec brouillard de guerre côté serveur.
+- Menus avec match IA en direct en fond, classement, statistiques par héros, réglages complets.
 
-### Première version d'AXIOM
-- Simulation autoritaire 128 tick, rendu illimité interpolé, entrée souris brute
-- Carte CITADEL : 2 sites, mid, long, tunnels, plateformes et caisses de crouch-jump
-- 12 armes avec patterns de recul déterministes, couteau, 4 grenades, bombe
-- Mode compétitif 5v5 (économie, mi-temps, prolongations), deathmatch, pratique, entraînement de visée
-- Bots à 5 niveaux avec stratégies d'équipe et utilitaires
-- Multijoueur : hébergement, connexion par IP, serveur dédié, compensation de latence
-- Launcher avec mises à jour automatiques depuis les Releases GitHub
-- Plus de 80 paramètres : souris, réticule (code de partage), vidéo, audio, touches, HUD, match
+## [1.0.0]
+- Version FPS initiale (remplacée).

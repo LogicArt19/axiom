@@ -1,108 +1,66 @@
-// AXIOM dedicated server : headless, authoritative, 128 tick.
-//   AxiomServer [--port 27115] [--mode comp|dm] [--bots 0-4] [--teamsize 1-5] [--rounds 13] [--name "AXIOM Server"]
-#include "../src/world.h"
-#include "../src/bot.h"
+// AxiomServer : dedicated headless server. Empty slots are played by the AI,
+// humans who join replace them. Usage: AxiomServer [--port 27115] [--size 1..3] [--bots 0..4] [--lobby 45] [--map 0..3]
+#include "../src/sim.h"
+#include "../src/ai.h"
 #include "../src/net.h"
-#include "../src/config.h"
 #include <thread>
-#include <csignal>
-#include <atomic>
-
-#ifdef _WIN32
-extern "C" __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned int);
-#endif
+#include <chrono>
+#include <cstring>
 
 using namespace ax;
 
-static std::atomic<bool> g_run{true};
-static void onSignal(int) { g_run = false; }
-
 int main(int argc, char** argv) {
-    int port = 27115, skill = 2, teamSize = 5;
-    GameMode mode = MODE_COMPETITIVE;
-    g_settings.load("server.ini");
-    for (int i = 1; i < argc; i++) {
-        std::string a = argv[i];
-        auto next = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
-        if (a == "--port") port = atoi(next().c_str());
-        else if (a == "--mode") mode = next() == "dm" ? MODE_DEATHMATCH : MODE_COMPETITIVE;
-        else if (a == "--bots") skill = atoi(next().c_str());
-        else if (a == "--teamsize") teamSize = atoi(next().c_str());
-        else if (a == "--rounds") g_settings.roundsToWin = atoi(next().c_str());
-        else if (a == "--roundtime") g_settings.roundTime = atoi(next().c_str());
-        else if (a == "--help" || a == "-h") {
-            printf("AxiomServer --port N --mode comp|dm --bots 0-4 --teamsize 1-5 --rounds N --roundtime S\n");
-            return 0;
-        }
+    int port = 27115, size = 3, bots = 2, mapArg = -1;
+    float lobby = 45;
+    for (int i = 1; i + 1 < argc; i++) {
+        if (!strcmp(argv[i], "--port")) port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--size")) size = std::clamp(atoi(argv[++i]), 1, 3);
+        else if (!strcmp(argv[i], "--bots")) bots = std::clamp(atoi(argv[++i]), 0, 4);
+        else if (!strcmp(argv[i], "--lobby")) lobby = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--map")) mapArg = std::clamp(atoi(argv[++i]), -1, MAP_COUNT - 1);
     }
-    signal(SIGINT, onSignal);
-    signal(SIGTERM, onSignal);
-#ifdef _WIN32
-    timeBeginPeriod(1);
-#endif
-    initWeapons();
-    g_settings.netPort = port;
-    World w;
-    BotSystem bots;
-    NetServer server;
-    w.init(mode);
-    const char* names[] = {"Nova", "Kairo", "Vex", "Lumen", "Rook", "Sable", "Onyx", "Talon", "Echo", "Drift", "Zephyr", "Raze", "Quill", "Hex"};
-    teamSize = std::clamp(teamSize, 1, 7);
-    for (int i = 0; i < teamSize * 2; i++) w.addPlayer(names[i % 14], true, i % 2, skill);
-    w.startMatch();
-    if (!server.start(port)) { fprintf(stderr, "Impossible d'ouvrir le port UDP %d\n", port); return 1; }
-    printf("AXIOM %s dedicated server | port %d | mode %s | bots %s | 128 tick\n", AXIOM_VERSION_STR, port,
-           mode == MODE_COMPETITIVE ? "competitive" : "deathmatch", botSkillName(skill));
-    for (auto& ip : sock::localAddresses()) printf("  adresse locale : %s:%d\n", ip.c_str(), port);
+    SetTraceLogLevel(LOG_WARNING);
+    initData();
+    printf("AXIOM server %s  -  port UDP %d  -  %dv%d  -  IA niveau %d\n", AXIOM_VERSION_STR, port, size, size, bots);
     fflush(stdout);
-    size_t logShown = server.log.size();
-    double next = nowSeconds();
-    double lastStatus = 0;
-    while (g_run) {
-        double now = nowSeconds();
-        if (now < next) {
-            double wait = next - now;
-            if (wait > 0.002) std::this_thread::sleep_for(std::chrono::microseconds((int)((wait - 0.001) * 1e6)));
-            continue;
+    for (;;) {
+        World w;
+        AISystem ai;
+        NetServer srv;
+        static int rotation = 0;
+        int mapId = mapArg >= 0 ? mapArg : (rotation++ % MAP_COUNT);
+        w.setup(size, mapId);
+        printf("Carte : %s\n", mapInfo(mapId).name);
+        const char* names[] = {"Atlas", "Nyx", "Orion", "Vesper", "Kael", "Lyra"};
+        for (int i = 0; i < size * 2; i++) w.addPlayer(names[i], i % 2, (UnitType)(HERO_FIRST + i % 6), true, bots);
+        w.lobbyEnd = 1e9f;
+        if (!srv.start(port)) { fprintf(stderr, "Impossible d'ouvrir le port %d\n", port); return 1; }
+        size_t logged = 0;
+        bool countdown = false;
+        float overAt = -1;
+        auto next = std::chrono::steady_clock::now();
+        for (;;) {
+            srv.poll(w);
+            if (w.phase == PH_LOBBY) {
+                int humans = srv.humanCount();
+                if (humans > 0 && !countdown) { countdown = true; w.lobbyEnd = w.time + lobby; printf("Lancement dans %.0f s (ou quand tous sont prêts)\n", lobby); }
+                if (humans == 0 && countdown) { countdown = false; w.lobbyEnd = 1e9f; }
+            }
+            bool wasLobby = w.phase == PH_LOBBY;
+            if (w.phase == PH_PLAYING) ai.think(w);
+            w.step();
+            if (wasLobby && w.phase == PH_PLAYING) { ai.reset(w); printf("Partie lancée\n"); }
+            srv.recordEvents(w.events);
+            w.events.clear();
+            if (w.tick % 2 == 0) srv.send(w);
+            while (logged < srv.log.size()) { printf("%s\n", srv.log[logged++].c_str()); fflush(stdout); }
+            if (w.phase == PH_OVER && overAt < 0) { overAt = w.time; printf("Fin de partie : victoire équipe %d (%.0f s)\n", w.winner, w.time); }
+            if (w.phase == PH_PLAYING && srv.humanCount() == 0 && w.time > 60) { printf("Plus aucun joueur : nouvelle partie\n"); break; }
+            if (overAt >= 0 && w.time - overAt > 20) break;
+            next += std::chrono::microseconds(1000000 / TICK_RATE);
+            std::this_thread::sleep_until(next);
+            if (std::chrono::steady_clock::now() > next + std::chrono::seconds(1)) next = std::chrono::steady_clock::now();
         }
-        next += TICK_DT;
-        if (now - next > 0.25) next = now;   // we fell behind: don't spiral
-        server.poll(w);
-        UserCmd cmds[MAX_PLAYERS];
-        for (int i = 0; i < MAX_PLAYERS; i++) {
-            cmds[i] = UserCmd{};
-            Player& p = w.players[i];
-            if (!p.active) continue;
-            if (p.isBot) bots.think(w, i, cmds[i]);
-            else if (p.isRemote) server.takeCmd(w, i, cmds[i]);
-        }
-        w.step(cmds);
-        server.afterStep(w);
-        server.recordEvents(w.events);
-        int every = std::max(1, TICK_RATE / std::clamp(g_settings.rate, 16, 128));
-        if (w.tick % every == 0) server.sendSnapshots(w);
-        for (auto& e : w.events) {
-            bots.onEvent(w, e);
-            if (e.type == EV_ROUND_END)
-                printf("[round %d] %s gagnent (%s) | score %d - %d\n", w.round, e.a == TEAM_ATK ? "ATTAQUANTS" : "DEFENSEURS",
-                       reasonText((RoundEndReason)e.value, (Team)e.a), w.squadScore[0], w.squadScore[1]);
-        }
-        w.events.clear();
-        while (logShown < server.log.size()) printf("%s\n", server.log[logShown++].c_str());
-        if (w.phase == PH_MATCH_END) {
-            printf("Fin du match : %d - %d. Nouveau match dans 10 s.\n", w.squadScore[0], w.squadScore[1]);
-            fflush(stdout);
-            for (int k = 0; k < 10 * TICK_RATE && g_run; k++) { server.poll(w); std::this_thread::sleep_for(std::chrono::milliseconds(8)); }
-            w.startMatch();
-            bots.reset();
-        }
-        if (now - lastStatus > 30) {
-            lastStatus = now;
-            printf("[status] tick %u | joueurs humains %d | round %d\n", w.tick, server.humanCount(), w.round);
-            fflush(stdout);
-        }
+        srv.stop(w);
     }
-    server.stop(w);
-    printf("Serveur arrete.\n");
-    return 0;
 }

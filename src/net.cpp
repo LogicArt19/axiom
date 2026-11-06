@@ -1,395 +1,445 @@
+// net.cpp : authoritative server + snapshot client
+//
+// Packets (UDP):
+//   C->S HELLO    magic ver name[24] hero
+//   S->C WELCOME  magic player
+//   S->C REJECT   magic reason
+//   C->S INPUT    magic ackSnap ackEvent clientTime  [cmdSeq cmd]*      (unacked commands are resent)
+//   S->C SNAP     magic seq chunk chunks  payload-part                   (payload split in ~1100 byte chunks)
+//   C->S BYE / S->C BYE
+// A snapshot only contains what the client's team can see (fog of war is enforced
+// by the server, so a modified client cannot reveal hidden units).
 #include "net.h"
-#include "config.h"
+#include <cstring>
 
 namespace ax {
 
-enum PacketType : uint8_t { PK_CONNECT = 1, PK_ACCEPT, PK_REJECT, PK_CMDS, PK_BUY, PK_BYE, PK_SNAP, PK_KICK };
+enum PktType : uint8_t { P_HELLO = 1, P_WELCOME, P_REJECT, P_INPUT, P_SNAP, P_BYE };
+static const int CHUNK = 1100;
+static const double TIMEOUT = 10.0;
 
-// ---------------------------------------------------------------------------
 struct Writer {
     std::vector<uint8_t> b;
     void u8(uint8_t v) { b.push_back(v); }
-    void i8(int8_t v) { b.push_back((uint8_t)v); }
-    void u16(uint16_t v) { u8(v & 255); u8(v >> 8); }
+    void u16(uint16_t v) { b.push_back(v & 255); b.push_back(v >> 8); }
+    void u32(uint32_t v) { for (int i = 0; i < 4; i++) b.push_back((v >> (8 * i)) & 255); }
     void i16(int16_t v) { u16((uint16_t)v); }
-    void u32(uint32_t v) { u16(v & 0xFFFF); u16(v >> 16); }
-    void f32(float f) { uint32_t v; memcpy(&v, &f, 4); u32(v); }
-    void v3(Vector3 v) { f32(v.x); f32(v.y); f32(v.z); }
-    void str(const char* s, int n) { for (int i = 0; i < n; i++) u8(s && i < (int)strlen(s) ? (uint8_t)s[i] : 0); }
-    void header(PacketType t) { u32(NET_MAGIC); u8(t); }
+    void f32(float v) { uint32_t u; memcpy(&u, &v, 4); u32(u); }
+    void pos(Vector2 p) { u16((uint16_t)clampf(p.x * 300.f, 0, 65535)); u16((uint16_t)clampf(p.y * 300.f, 0, 65535)); }
+    void str(const char* s, int n) { for (int i = 0; i < n; i++) b.push_back(i < (int)strlen(s) ? (uint8_t)s[i] : 0); }
 };
 struct Reader {
-    const uint8_t* d; int n; int p = 0; bool bad = false;
+    const uint8_t* d; int n, i = 0;
+    bool bad = false;
     Reader(const uint8_t* d_, int n_) : d(d_), n(n_) {}
-    bool need(int k) { if (p + k > n) { bad = true; return false; } return true; }
-    uint8_t u8() { if (!need(1)) return 0; return d[p++]; }
-    int8_t i8() { return (int8_t)u8(); }
-    uint16_t u16() { uint16_t a = u8(); return (uint16_t)(a | (u8() << 8)); }
+    bool need(int k) { if (i + k > n) { bad = true; return false; } return true; }
+    uint8_t u8() { if (!need(1)) return 0; return d[i++]; }
+    uint16_t u16() { if (!need(2)) return 0; uint16_t v = d[i] | (d[i + 1] << 8); i += 2; return v; }
+    uint32_t u32() { if (!need(4)) return 0; uint32_t v = 0; for (int k = 0; k < 4; k++) v |= (uint32_t)d[i + k] << (8 * k); i += 4; return v; }
     int16_t i16() { return (int16_t)u16(); }
-    uint32_t u32() { uint32_t a = u16(); return a | ((uint32_t)u16() << 16); }
-    float f32() { uint32_t v = u32(); float f; memcpy(&f, &v, 4); return f; }
-    Vector3 v3() { Vector3 v; v.x = f32(); v.y = f32(); v.z = f32(); return v; }
-    void str(char* out, int n_) { for (int i = 0; i < n_; i++) out[i] = (char)u8(); out[n_ - 1] = 0; }
+    float f32() { uint32_t u = u32(); float v; memcpy(&v, &u, 4); return v; }
+    Vector2 pos() { float x = u16() / 300.f; float y = u16() / 300.f; return {x, y}; }
+    void str(char* out, int n) { for (int k = 0; k < n; k++) out[k] = (char)u8(); out[n - 1] = 0; }
 };
 
-static void writeEvent(Writer& w, const GameEvent& e) {
-    w.u8(e.type); w.i8(e.a); w.i8(e.b); w.u8(e.weapon); w.u8(e.flags); w.i16(e.value); w.v3(e.pos); w.v3(e.pos2);
+static void writeCommand(Writer& w, const Command& c) {
+    w.u8(c.type); w.u8(c.queue); w.u8(c.a); w.f32(c.pt.x); w.f32(c.pt.y); w.u16(c.target);
+    w.u8((uint8_t)std::min<size_t>(c.units.size(), 200));
+    for (size_t i = 0; i < c.units.size() && i < 200; i++) w.u16(c.units[i]);
 }
-static GameEvent readEvent(Reader& r) {
-    GameEvent e{};
-    e.type = (EvType)r.u8(); e.a = r.i8(); e.b = r.i8(); e.weapon = r.u8(); e.flags = r.u8(); e.value = r.i16(); e.pos = r.v3(); e.pos2 = r.v3();
+static Command readCommand(Reader& r) {
+    Command c;
+    c.type = (CmdType)r.u8(); c.queue = r.u8() != 0; c.a = r.u8(); c.pt.x = r.f32(); c.pt.y = r.f32(); c.target = r.u16();
+    int n = r.u8();
+    for (int i = 0; i < n && !r.bad; i++) c.units.push_back(r.u16());
+    c.pt.x = clampf(c.pt.x, 0, Map::SIZE); c.pt.y = clampf(c.pt.y, 0, Map::SIZE);
+    return c;
+}
+
+static void writeEvent(Writer& w, uint32_t seq, const GameEvent& e) {
+    w.u32(seq); w.u8(e.type); w.i16(e.a); w.i16(e.b); w.u8(e.c); w.u8((uint8_t)e.player); w.pos(e.p); w.pos(e.p2); w.i16(e.value);
+}
+static GameEvent readEvent(Reader& r, uint32_t& seq) {
+    GameEvent e;
+    seq = r.u32(); e.type = (EvType)r.u8(); e.a = r.i16(); e.b = r.i16(); e.c = r.u8(); e.player = (int8_t)r.u8(); e.p = r.pos(); e.p2 = r.pos(); e.value = r.i16();
     return e;
 }
 
+static bool cosmetic(EvType t) { return t == EV_ATTACK || t == EV_HIT; }
+static bool privateEvent(EvType t) {
+    return t == EV_NO_GOLD || t == EV_NO_SUPPLY || t == EV_CANT_BUILD || t == EV_UNIT_DONE || t == EV_BUILD_DONE || t == EV_RESEARCH_DONE ||
+           t == EV_UNDER_ATTACK || t == EV_ITEM || t == EV_BUILD_START;
+}
+static bool globalEvent(EvType t) {
+    return t == EV_HERO_KILL || t == EV_TITAN_SLAIN || t == EV_TOWER_DOWN || t == EV_GAME_OVER || t == EV_WAVE || t == EV_GAME_START;
+}
+
 // ===========================================================================
-// SERVER
+// server
 // ===========================================================================
+struct ServerExtra {
+    // per client: last event seq sent (for cosmetic events), visibility masks per event
+    std::map<uint32_t, uint8_t> visMask;
+    uint32_t lastSent[MAX_PLAYERS * 2] = {0};
+    double clientTime[MAX_PLAYERS * 2] = {0};
+};
+static ServerExtra g_sx;
+
 bool NetServer::start(int p) {
-    if (!sock::init()) return false;
+    sock::init();
     sock_ = sock::open((uint16_t)p);
     if (sock_ < 0) return false;
     port = p;
     running = true;
-    clients.clear();
+    clients.assign(MAX_PLAYERS * 2, RemoteClient{});
     eventLog.clear();
-    eventSeq = 0;
-    log.push_back(std::string("Serveur ouvert sur le port ") + std::to_string(p));
+    g_sx = ServerExtra{};
+    snapSeq = eventSeq = 0;
+    log.push_back(TextFormat("Serveur démarré sur le port %d", p));
     return true;
 }
 
 void NetServer::stop(World& w) {
-    if (!running) return;
-    for (auto& c : clients) {
-        Writer wr; wr.header(PK_KICK); wr.str("Le serveur a ferme la partie", 48);
-        for (int k = 0; k < 3; k++) sock::sendTo(sock_, c.addr, wr.b.data(), (int)wr.b.size());
-        if (c.playerId >= 0) { w.players[c.playerId].isRemote = false; w.players[c.playerId].isBot = true; }
+    (void)w;
+    if (sock_ >= 0) {
+        uint8_t bye[5]; uint32_t m = NET_MAGIC; memcpy(bye, &m, 4); bye[4] = P_BYE;
+        for (auto& c : clients) if (c.active) sock::sendTo(sock_, c.addr, bye, 5);
+        sock::close(sock_);
     }
-    clients.clear();
-    sock::close(sock_);
     sock_ = -1;
     running = false;
+    clients.clear();
 }
 
-int NetServer::humanCount() const { int n = 0; for (auto& c : clients) if (c.active) n++; return n; }
+int NetServer::humanCount() const {
+    int n = 0;
+    for (auto& c : clients) if (c.active) n++;
+    return n;
+}
 
-int NetServer::assignPlayer(World& w, const char* name) {
-    // pick the squad with fewer humans, then take over one of its bots
+static int takeSlot(World& w, const char* name, int hero) {
+    // the team with fewer humans gets the new player; an AI slot is replaced
     int humans[2] = {0, 0};
-    for (auto& p : w.players) if (p.active && !p.isBot) humans[p.squad & 1]++;
-    int order[2] = {humans[0] <= humans[1] ? 0 : 1, humans[0] <= humans[1] ? 1 : 0};
-    for (int k = 0; k < 2; k++) {
-        for (auto& p : w.players) {
-            if (!p.active || !p.isBot) continue;
-            if (w.mode != MODE_DEATHMATCH && p.squad != order[k]) continue;
-            p.isBot = false; p.isRemote = true;
+    for (auto& p : w.players) if (p.active && !p.isAI) humans[p.team]++;
+    int pref = humans[0] <= humans[1] ? 0 : 1;
+    for (int pass = 0; pass < 2; pass++) {
+        int team = pass == 0 ? pref : 1 - pref;
+        for (int i = 0; i < MAX_PLAYERS; i++) {
+            PlayerState& p = w.players[i];
+            if (!p.active || !p.isAI || p.team != team) continue;
+            p.isAI = false; p.isRemote = true; p.ready = false;
             snprintf(p.name, sizeof p.name, "%s", name);
-            return p.id;
+            if (w.phase == PH_LOBBY) p.hero = (UnitType)(HERO_FIRST + std::clamp(hero, 0, 5));
+            return i;
         }
     }
-    int id = w.addPlayer(name, false, order[0], 2);
-    if (id >= 0) {
-        w.players[id].isRemote = true;
-        if (w.mode != MODE_COMPETITIVE) w.respawnPlayer(w.players[id], false);
-    }
-    return id;
-}
-
-void NetServer::handleConnect(World& w, const sock::Addr& from, const uint8_t* d, int n) {
-    Reader r(d, n);
-    uint32_t ver = r.u32();
-    char name[24]; r.str(name, 24);
-    if (r.bad) return;
-    RemoteClient* existing = nullptr;
-    for (auto& c : clients) if (c.active && c.addr == from) existing = &c;
-    if (ver != NET_VERSION) {
-        Writer wr; wr.header(PK_REJECT); wr.str("Version du jeu differente", 48);
-        sock::sendTo(sock_, from, wr.b.data(), (int)wr.b.size());
-        return;
-    }
-    if (!existing) {
-        if (humanCount() >= MAX_PLAYERS - 1) {
-            Writer wr; wr.header(PK_REJECT); wr.str("Serveur plein", 48);
-            sock::sendTo(sock_, from, wr.b.data(), (int)wr.b.size());
-            return;
-        }
-        int id = assignPlayer(w, name[0] ? name : "Joueur");
-        if (id < 0) {
-            Writer wr; wr.header(PK_REJECT); wr.str("Aucune place disponible", 48);
-            sock::sendTo(sock_, from, wr.b.data(), (int)wr.b.size());
-            return;
-        }
-        RemoteClient c;
-        c.active = true; c.addr = from; c.playerId = id; c.name = name; c.lastHeard = nowSeconds();
-        c.ackEventSeq = eventSeq;     // don't replay old history
-        clients.push_back(c);
-        existing = &clients.back();
-        log.push_back(std::string(name) + " a rejoint (" + sock::toString(from) + ")");
-    }
-    Writer wr; wr.header(PK_ACCEPT);
-    wr.u8((uint8_t)existing->playerId); wr.u8(w.mode); wr.u8((uint8_t)w.roundsToWin);
-    wr.u16((uint16_t)w.roundTimeSec); wr.u16((uint16_t)w.buyTimeSec); wr.u16((uint16_t)w.freezeTimeSec);
-    wr.u32(w.tick);
-    sock::sendTo(sock_, from, wr.b.data(), (int)wr.b.size());
+    return -1;
 }
 
 void NetServer::poll(World& w) {
-    if (!running) return;
+    if (sock_ < 0) return;
+    double now = nowSeconds();
     uint8_t buf[4096];
     sock::Addr from;
     int n;
-    double now = nowSeconds();
     while ((n = sock::recvFrom(sock_, from, buf, sizeof buf)) > 0) {
         Reader r(buf, n);
         if (r.u32() != NET_MAGIC) continue;
         uint8_t type = r.u8();
-        if (type == PK_CONNECT) { handleConnect(w, from, buf + 5, n - 5); continue; }
-        RemoteClient* c = nullptr;
-        for (auto& cl : clients) if (cl.active && cl.addr == from) c = &cl;
-        if (!c) continue;
-        c->lastHeard = now;
-        if (type == PK_CMDS) {
-            r.u32();                       // last snapshot seq (unused)
-            uint32_t ackEv = r.u32();
-            c->pingMs = r.u16();
-            if (ackEv > c->ackEventSeq && ackEv <= eventSeq) c->ackEventSeq = ackEv;
-            int cnt = r.u8();
-            for (int i = 0; i < cnt && !r.bad; i++) {
-                UserCmd cmd;
-                cmd.tick = r.u32(); cmd.yaw = r.f32(); cmd.pitch = r.f32();
-                cmd.fwd = r.i8() / 127.f; cmd.side = r.i8() / 127.f;
-                cmd.buttons = r.u16(); cmd.select = r.u8(); cmd.viewTick = r.u32();
-                if (r.bad) break;
-                if (cmd.tick > c->lastRecvCmdTick) { c->queue.push_back(cmd); c->lastRecvCmdTick = cmd.tick; }
+        int ci = -1;
+        for (size_t i = 0; i < clients.size(); i++) if (clients[i].active && clients[i].addr == from) ci = (int)i;
+        if (type == P_HELLO) {
+            uint32_t ver = r.u32();
+            char name[24]; r.str(name, 24);
+            int hero = r.u8();
+            Writer o; o.u32(NET_MAGIC);
+            if (ver != NET_VERSION) { o.u8(P_REJECT); o.str("Version différente : mettez le jeu à jour", 64); sock::sendTo(sock_, from, o.b.data(), (int)o.b.size()); continue; }
+            if (ci < 0) {
+                int slot = -1;
+                for (size_t i = 0; i < clients.size(); i++) if (!clients[i].active) { slot = (int)i; break; }
+                int pl = slot >= 0 ? takeSlot(w, name[0] ? name : "Joueur", hero) : -1;
+                if (pl < 0) { o.u8(P_REJECT); o.str("Le salon est complet", 64); sock::sendTo(sock_, from, o.b.data(), (int)o.b.size()); continue; }
+                RemoteClient& c = clients[slot];
+                c = RemoteClient{};
+                c.active = true; c.addr = from; c.player = pl; c.name = name; c.lastHeard = now;
+                g_sx.lastSent[slot] = eventSeq;
+                c.ackEvent = eventSeq;
+                ci = slot;
+                log.push_back(std::string(name) + " a rejoint (" + sock::toString(from) + ")");
             }
-            while (c->queue.size() > 8) c->queue.pop_front();
-            if (c->playerId >= 0) w.players[c->playerId].ping = c->pingMs;
-        } else if (type == PK_BUY) {
-            int16_t item = r.i16();
-            uint32_t nonce = r.u32();
-            if (!r.bad && !c->buyNonces.count(nonce)) {
-                c->buyNonces[nonce] = true;
-                if (item > 0) w.tryBuy(c->playerId, item); else if (item < 0) w.trySell(c->playerId, -item);
-            }
-        } else if (type == PK_BYE) {
-            c->lastHeard = -100;
+            o.u8(P_WELCOME); o.u8((uint8_t)clients[ci].player);
+            sock::sendTo(sock_, from, o.b.data(), (int)o.b.size());
+            continue;
         }
-    }
-    // timeouts -> the bot takes over again
-    for (auto& c : clients) {
-        if (!c.active) continue;
-        if (now - c.lastHeard > 10.0) {
+        if (ci < 0) continue;
+        RemoteClient& c = clients[ci];
+        c.lastHeard = now;
+        if (type == P_BYE) {
+            PlayerState& p = w.players[c.player];
+            p.isAI = true; p.isRemote = false;
+            log.push_back(c.name + " est parti (remplacé par l'IA)");
             c.active = false;
-            if (c.playerId >= 0) {
-                Player& p = w.players[c.playerId];
-                p.isRemote = false; p.isBot = true;
-                snprintf(p.name, sizeof p.name, "BOT %.18s", c.name.c_str());
+            continue;
+        }
+        if (type == P_INPUT) {
+            r.u32();                         // ack snapshot (unused, snapshots are full states)
+            uint32_t ackEv = r.u32();
+            if (ackEv > c.ackEvent && ackEv <= eventSeq) c.ackEvent = ackEv;
+            g_sx.clientTime[ci] = r.f32();
+            int cnt = r.u8();
+            for (int k = 0; k < cnt && !r.bad; k++) {
+                uint32_t seq = r.u32();
+                Command cmd = readCommand(r);
+                if (r.bad) break;
+                if (seq <= c.lastCmdSeq) continue;
+                c.lastCmdSeq = seq;
+                cmd.player = (uint8_t)c.player;      // never trust the client about who it is
+                w.issue(cmd);
             }
-            log.push_back(c.name + " a quitte la partie");
         }
     }
-    clients.erase(std::remove_if(clients.begin(), clients.end(), [](const RemoteClient& c) { return !c.active; }), clients.end());
-}
-
-static thread_local bool g_processedThisTick[MAX_PLAYERS];
-
-bool NetServer::takeCmd(World& w, int pid, UserCmd& out) {
-    for (auto& c : clients) {
-        if (!c.active || c.playerId != pid) continue;
-        g_processedThisTick[pid] = false;
-        if (!c.queue.empty()) {
-            out = c.queue.front();
-            c.queue.pop_front();
-            c.lastCmd = out;
-            c.lastProcessedTick = out.tick;
-            g_processedThisTick[pid] = true;
-        } else {
-            out = c.lastCmd;
-            out.select = 0;
+    for (size_t i = 0; i < clients.size(); i++) {
+        RemoteClient& c = clients[i];
+        if (c.active && now - c.lastHeard > TIMEOUT) {
+            PlayerState& p = w.players[c.player];
+            p.isAI = true; p.isRemote = false;
+            log.push_back(c.name + " a perdu la connexion (remplacé par l'IA)");
+            c.active = false;
         }
-        int lag = (int)(w.tick + 1) - (int)out.viewTick;
-        out.lagTicks = (int16_t)std::clamp(lag, 0, HISTORY - 4);
-        return true;
     }
-    return false;
-}
-
-void NetServer::afterStep(World& w) {
-    for (auto& c : clients)
-        if (c.active && c.playerId >= 0 && g_processedThisTick[c.playerId]) { c.procTime = w.time; g_processedThisTick[c.playerId] = false; }
 }
 
 void NetServer::recordEvents(const std::vector<GameEvent>& evs) {
-    for (auto& e : evs) eventLog.push_back({++eventSeq, e});
-    while (eventLog.size() > 2048) eventLog.pop_front();
+    if (!running) return;
+    // visibility is captured now, when the world matches the event
+    for (auto& e : evs) {
+        eventSeq++;
+        eventLog.push_back({eventSeq, e});
+        g_sx.visMask[eventSeq] = 0;
+    }
+    while (eventLog.size() > 4000) { g_sx.visMask.erase(eventLog.front().first); eventLog.pop_front(); }
 }
 
-void NetServer::sendSnapshots(World& w) {
-    if (!running || clients.empty()) return;
+static void writeEntity(Writer& w, const World& W, const Entity& e, int player, int team) {
+    bool own = e.owner == player || (e.team == team && e.kind == K_BUILDING);
+    bool ally = e.team == team;
+    w.u16(e.id); w.u8(e.type); w.u8((uint8_t)e.owner); w.u8(e.team);
+    w.pos(e.pos);
+    w.u8((uint8_t)(fmodf(e.facing + 6.2831853f * 4, 6.2831853f) / 6.2831853f * 255));
+    w.f32(e.hp); w.f32(e.maxHp);
+    uint16_t flags = 0;
+    if (e.constructing) flags |= 1;
+    if (W.time < e.stunUntil) flags |= 2;
+    if (W.time < e.slowUntil) flags |= 4;
+    if (W.time < e.stealthUntil) flags |= 8;
+    if (W.time < e.hasteUntil) flags |= 16;
+    if (W.time < e.dmgUntil) flags |= 32;
+    if (e.shield > 0 && W.time < e.shieldUntil) flags |= 64;
+    if (e.carry > 0) flags |= 128;
+    if (own) flags |= 256;
+    if (e.kind == K_HERO) flags |= 512;
+    if (e.summoned) flags |= 1024;
+    if (e.kind == K_RESOURCE || e.type == B_EXTRACTOR) flags |= 2048;
+    if (e.carryFlux) flags |= 4096;
+    w.u16(flags);
+    w.u8((uint8_t)clampf((W.time - e.attackAnim) * 100, 0, 255));
+    if (flags & 1) w.u8((uint8_t)(clampf(e.buildProgress / std::max(0.1f, unitDef(e.type).buildTime), 0, 1) * 255));
+    if (flags & 64) w.f32(e.shield);
+    if (flags & 2048) { w.u16((uint16_t)std::max(0, e.amount)); w.u8(e.rich); }
+    if (flags & 512) {
+        w.f32(e.mana); w.f32(e.maxMana); w.u8((uint8_t)e.level);
+        for (int k = 0; k < 4; k++) w.u8(e.items[k]);
+    }
+    if (flags & 256) {
+        w.u8(e.order.type); w.pos(e.order.pt); w.u16(e.order.target);
+        w.u8(e.hasRally); w.pos(e.rally);
+        w.u8((uint8_t)std::min<size_t>(e.prod.size(), 10));
+        for (size_t k = 0; k < e.prod.size() && k < 10; k++) w.u8(e.prod[k]);
+        w.f32(e.prodProgress);
+        w.u8((uint8_t)e.research); w.f32(e.researchProgress);
+        w.u16((uint16_t)e.carry); w.f32(e.gatherTimer);
+        if (e.kind == K_HERO) { w.u32((uint32_t)e.xp); for (int k = 0; k < 4; k++) w.f32(e.abilCd[k]); }
+    }
+    (void)ally;
+}
+
+void NetServer::send(World& w) {
+    if (sock_ < 0) return;
     snapSeq++;
-    float st = w.time;
-    for (auto& c : clients) {
+    double now = nowSeconds();
+    for (auto& e : eventLog) {
+        uint8_t& m = g_sx.visMask[e.first];
+        if (m & 0x80) continue;
+        // mark visibility once (first send after the event)
+        for (int t = 0; t < 2; t++) if (w.cellVisible(t, e.second.p)) m |= (uint8_t)(1 << t);
+        m |= 0x80;
+    }
+    for (size_t ci = 0; ci < clients.size(); ci++) {
+        RemoteClient& c = clients[ci];
         if (!c.active) continue;
-        Writer wr;
-        wr.header(PK_SNAP);
-        wr.u32(snapSeq); wr.u32(w.tick); wr.u32(c.lastProcessedTick);
-        // game state
-        wr.u8(w.mode); wr.u8(w.phase); wr.f32(w.phaseEnd - st); wr.f32(w.roundStartTime - st); wr.f32(w.buyEndTime - st);
-        wr.u8((uint8_t)w.round); wr.u8((uint8_t)w.squadScore[0]); wr.u8((uint8_t)w.squadScore[1]);
-        wr.u8(w.squadSide[0]); wr.u8(w.squadSide[1]); wr.u8(w.overtime); wr.i8((int8_t)w.matchWinnerSquad);
-        wr.i8((int8_t)w.lastMvp); wr.u8(w.lastWinner); wr.u8(w.lastReason); wr.f32(w.dmEndTime - st); wr.u8((uint8_t)w.roundsToWin);
-        wr.u8((uint8_t)std::min<size_t>(w.history.size(), 60));
-        for (size_t i = 0; i < std::min<size_t>(w.history.size(), 60); i++) {
-            auto& h = w.history[i];
-            wr.u8((uint8_t)(h.winner | (h.reason << 2) | (h.winnerSquad << 5)));
-        }
-        // bomb
-        wr.u8(w.bomb.state); wr.i8((int8_t)w.bomb.carrier); wr.v3(w.bomb.pos); wr.f32(w.bomb.explodeTime - st);
-        wr.i8((int8_t)w.bomb.defuser); wr.f32(w.bomb.defuseStart - st); wr.f32(w.bomb.defuseEnd - st); wr.u8(w.bomb.site);
+        int player = c.player, team = w.players[player].team;
+        Writer s;
+        s.u32(w.tick); s.u8((uint8_t)w.mapId); s.f32(w.time); s.u8(w.phase); s.u8((uint8_t)(int8_t)w.winner); s.f32(w.lobbyEnd - w.time);
+        s.u32(c.lastCmdSeq); s.f32((float)g_sx.clientTime[ci]);
+        s.f32(w.titanBuffUntil[0] - w.time); s.f32(w.titanBuffUntil[1] - w.time); s.f32(w.nextWave - w.time);
+        s.u16(w.core[0]); s.u16(w.core[1]);
         // players
-        int cnt = 0;
-        for (auto& p : w.players) if (p.active) cnt++;
-        wr.u8((uint8_t)cnt);
-        for (auto& p : w.players) {
+        for (int i = 0; i < MAX_PLAYERS; i++) {
+            const PlayerState& p = w.players[i];
+            s.u8(p.active | (p.isAI << 1) | (p.ready << 2));
             if (!p.active) continue;
-            uint8_t f1 = (p.alive ? 1 : 0) | (p.isBot ? 2 : 0) | (p.onGround ? 4 : 0) | (p.hasBomb ? 8 : 0) | (p.kit ? 16 : 0) |
-                         (p.helmet ? 32 : 0) | (p.defusing ? 64 : 0) | (p.planting ? 128 : 0);
-            uint8_t f2 = (p.reloading ? 1 : 0) | (p.pinPulled ? 2 : 0) | (p.isRemote ? 4 : 0);
-            wr.u8((uint8_t)p.id); wr.u8(f1); wr.u8(f2); wr.u8(p.team); wr.u8((uint8_t)p.squad);
-            wr.str(p.name, 16);
-            wr.v3(p.pos); wr.v3(p.vel); wr.f32(p.yaw); wr.f32(p.pitch); wr.u8((uint8_t)(p.duck * 255));
-            wr.u8((uint8_t)std::max(0, p.health)); wr.u8((uint8_t)p.armor); wr.u16((uint16_t)p.money);
-            wr.u8(p.activeW); wr.u8(p.primary); wr.u8(p.secondary);
-            wr.u8((uint8_t)(p.nades[0] | (p.nades[1] << 2) | (p.nades[2] << 4) | (p.nades[3] << 6)));
-            wr.u8((uint8_t)p.scope);
-            wr.i16((int16_t)p.kills); wr.i16((int16_t)p.deaths); wr.i16((int16_t)p.assists); wr.i16((int16_t)p.headshots);
-            wr.i16((int16_t)std::min(p.damage, 32000)); wr.i16((int16_t)p.mvps); wr.i16((int16_t)p.score); wr.u16((uint16_t)p.ping);
-            wr.i16((int16_t)p.clip[0]); wr.i16((int16_t)p.clip[1]); wr.i16((int16_t)p.reserve[0]); wr.i16((int16_t)p.reserve[1]);
-            wr.f32(p.flashEnd - st); wr.f32(p.flashDur); wr.f32(p.punchYaw); wr.f32(p.punchPitch);
-            if (p.id == c.playerId) {
-                float pt = c.procTime;
-                wr.f32(p.nextAttack - pt); wr.f32(p.drawEnd - pt); wr.f32(p.reloadEnd - pt); wr.f32(p.lastShotTime - pt);
-                wr.f32(p.plantStart - pt); wr.f32(p.inspectUntil - pt);
-                wr.f32(p.spreadAccum); wr.u8((uint8_t)std::min(p.shotsFired, 255)); wr.u8((uint8_t)p.scopeResume); wr.f32(p.stamina);
-                wr.u8((uint8_t)((p.attackHeld ? 1 : 0) | (p.attack2Held ? 2 : 0) | (p.jumpHeld ? 4 : 0) | (p.dropHeld ? 8 : 0)));
-                wr.u8(p.lastW); wr.u8(p.throwStrength); wr.f32(p.stepAccum); wr.f32(p.tagUntil - pt); wr.f32(p.tagAmount);
-            }
+            s.str(p.name, 24); s.u8(p.team); s.u8(p.hero); s.u16(p.heroId);
+            s.u16((uint16_t)(p.team == team ? std::min(p.gold, 65535) : 0));
+            s.u16((uint16_t)(p.team == team ? std::min(p.flux, 65535) : 0));
+            s.u8((uint8_t)p.upgrades[0]); s.u8((uint8_t)p.upgrades[1]);
+            s.u32((uint32_t)p.goldEarned); s.u16((uint16_t)p.unitsProduced); s.u16((uint16_t)p.unitsKilled); s.u16((uint16_t)p.unitsLost); s.u32((uint32_t)p.actions);
+            int ping = 0;
+            for (auto& cc : clients) if (cc.active && cc.player == i) ping = cc.ping;
+            s.u16((uint16_t)ping);
+            const Entity* h = p.heroId < w.ents.size() ? &w.ents[p.heroId] : nullptr;
+            if (h && h->id) {
+                s.u8((uint8_t)h->level); s.u16((uint16_t)h->kills); s.u16((uint16_t)h->deaths); s.u16((uint16_t)h->assists); s.u16((uint16_t)h->lastHits);
+                for (int k = 0; k < 4; k++) s.u8(h->items[k]);
+                s.f32(h->alive ? 0 : std::max(0.f, h->respawnAt - w.time));
+            } else { s.u8(1); for (int k = 0; k < 4; k++) s.u16(0); for (int k = 0; k < 4; k++) s.u8(0); s.f32(0); }
         }
-        // smokes, fires, projectiles, drops
-        wr.u8((uint8_t)std::min<size_t>(w.smokes.size(), 32));
-        for (size_t i = 0; i < std::min<size_t>(w.smokes.size(), 32); i++) { wr.v3(w.smokes[i].pos); wr.f32(w.smokes[i].start - st); wr.f32(w.smokes[i].end - st); }
-        wr.u8((uint8_t)std::min<size_t>(w.fires.size(), 32));
-        for (size_t i = 0; i < std::min<size_t>(w.fires.size(), 32); i++) { wr.v3(w.fires[i].pos); wr.f32(w.fires[i].start - st); wr.f32(w.fires[i].end - st); wr.f32(w.fires[i].radius); }
-        wr.u8((uint8_t)std::min<size_t>(w.projectiles.size(), 32));
-        for (size_t i = 0; i < std::min<size_t>(w.projectiles.size(), 32); i++) { wr.u8(w.projectiles[i].type); wr.v3(w.projectiles[i].pos); }
-        wr.u8((uint8_t)std::min<size_t>(w.drops.size(), 40));
-        for (size_t i = 0; i < std::min<size_t>(w.drops.size(), 40); i++) { wr.u8(w.drops[i].w); wr.v3(w.drops[i].pos); wr.f32(w.drops[i].spawnTime - st); }
-        // reliable event stream
-        uint32_t first = c.ackEventSeq + 1;
-        if (!eventLog.empty() && first < eventLog.front().first) first = eventLog.front().first;
-        std::vector<const GameEvent*> evs;
-        for (auto& pe : eventLog) if (pe.first >= first && evs.size() < 40) evs.push_back(&pe.second);
-        wr.u32(first);
-        wr.u8((uint8_t)evs.size());
-        for (auto* e : evs) writeEvent(wr, *e);
-        sock::sendTo(sock_, c.addr, wr.b.data(), (int)wr.b.size());
+        // entities
+        s.u16((uint16_t)w.ents.size());
+        std::vector<const Entity*> list;
+        for (auto& e : w.ents) {
+            if (!e.alive) continue;
+            bool known = e.team == team || e.kind == K_RESOURCE || e.kind == K_TOWER || e.type == B_CORE || w.visibleTo(team, e);
+            if (e.team != team && e.kind != K_RESOURCE && e.kind != K_TOWER && e.type != B_CORE && !w.cellVisible(team, e.pos)) known = false;
+            if (known) list.push_back(&e);
+        }
+        s.u16((uint16_t)list.size());
+        for (auto* e : list) writeEntity(s, w, *e, player, team);
+        // projectiles / zones that can be seen
+        std::vector<const Projectile*> pl;
+        for (auto& p : w.projs) if (p.alive && (p.team == team || w.cellVisible(team, p.pos))) pl.push_back(&p);
+        s.u16((uint16_t)std::min<size_t>(pl.size(), 400));
+        for (size_t k = 0; k < pl.size() && k < 400; k++) {
+            auto* p = pl[k];
+            s.pos(p->pos); s.f32(p->dir.x); s.f32(p->dir.y); s.u8((uint8_t)clampf(p->height * 40, 0, 255)); s.u8(p->visual); s.u8(p->team); s.f32(p->speed); s.u8(p->srcType);
+        }
+        std::vector<const Zone*> zl;
+        for (auto& z : w.zones) if (z.team == team || w.cellVisible(team, z.pos)) zl.push_back(&z);
+        s.u16((uint16_t)zl.size());
+        for (auto* z : zl) { s.u8(z->kind); s.pos(z->pos); s.f32(z->radius); s.f32(z->start - w.time); s.f32(z->end - w.time); s.f32(z->delay); s.u8(z->team); s.u8(z->fired); }
+        // events
+        std::vector<std::pair<uint32_t, const GameEvent*>> ev;
+        for (auto& e : eventLog) {
+            if (e.first <= c.ackEvent) continue;
+            const GameEvent& g = e.second;
+            if (cosmetic(g.type) && e.first <= g_sx.lastSent[ci]) continue;
+            bool ok;
+            if (privateEvent(g.type)) ok = g.player == player;
+            else if (globalEvent(g.type)) ok = true;
+            else if (g.type == EV_LEVELUP || g.type == EV_RESPAWN) ok = g.player >= 0 && w.players[g.player].team == team;
+            else ok = (g_sx.visMask[e.first] & (1 << team)) != 0;
+            if (ok) ev.push_back({e.first, &g});
+            if (ev.size() >= 250) break;
+        }
+        g_sx.lastSent[ci] = eventSeq;
+        s.u32(eventSeq);
+        s.u16((uint16_t)ev.size());
+        for (auto& e : ev) writeEvent(s, e.first, *e.second);
+        // send in chunks
+        int total = (int)s.b.size();
+        int chunks = (total + CHUNK - 1) / CHUNK;
+        for (int k = 0; k < chunks; k++) {
+            Writer o;
+            o.u32(NET_MAGIC); o.u8(P_SNAP); o.u32(snapSeq); o.u8((uint8_t)k); o.u8((uint8_t)chunks);
+            int len = std::min(CHUNK, total - k * CHUNK);
+            o.b.insert(o.b.end(), s.b.begin() + k * CHUNK, s.b.begin() + k * CHUNK + len);
+            sock::sendTo(sock_, c.addr, o.b.data(), (int)o.b.size());
+        }
+        (void)now;
     }
 }
 
 // ===========================================================================
-// CLIENT
+// client
 // ===========================================================================
-bool NetClient::connect(const char* host, int port, const char* nm) {
+struct ClientExtra {
+    uint32_t assemblingSeq = 0;
+    int chunksExpected = 0, chunksGot = 0;
+    std::vector<std::vector<uint8_t>> parts;
+    bool welcomed = false;
+};
+static ClientExtra g_cx;
+
+bool NetClient::connect(const char* host, int port, const char* nm, int h) {
     disconnect();
-    if (!sock::init()) { state = FAILED; reason = "Initialisation reseau impossible"; return false; }
-    if (!sock::resolve(host, (uint16_t)port, server)) { state = FAILED; reason = "Adresse introuvable"; return false; }
+    sock::init();
+    if (!sock::resolve(host, (uint16_t)port, server)) { state = FAILED; reason = std::string("Adresse introuvable : ") + host; return false; }
     sock_ = sock::open(0);
-    if (sock_ < 0) { state = FAILED; reason = "Socket indisponible"; return false; }
-    name = nm;
+    if (sock_ < 0) { state = FAILED; reason = "Impossible d'ouvrir un socket"; return false; }
+    name = nm; hero = h;
     state = CONNECTING;
-    connectStart = nowSeconds();
-    lastConnectSend = 0;
-    lastSnapSeq = 0; lastEventSeq = 0; latestServerTick = 0;
-    pending.clear(); snaps.clear(); sendTimes.clear();
-    lastCmdTick = 0; snapsReceived = snapsExpected = 0;
-    localId = -1;
+    reason.clear();
+    connectStart = lastHeard = nowSeconds();
+    lastSend = 0; lastSnap = lastEvent = cmdSeq = 0; lastSnapTime = 0;
+    unacked.clear();
+    localPlayer = -1;
+    g_cx = ClientExtra{};
     return true;
 }
 
 void NetClient::disconnect() {
     if (sock_ >= 0) {
-        Writer wr; wr.header(PK_BYE);
-        for (int i = 0; i < 3; i++) sock::sendTo(sock_, server, wr.b.data(), (int)wr.b.size());
+        uint8_t bye[5]; uint32_t m = NET_MAGIC; memcpy(bye, &m, 4); bye[4] = P_BYE;
+        if (state == CONNECTED) for (int i = 0; i < 3; i++) sock::sendTo(sock_, server, bye, 5);
         sock::close(sock_);
     }
     sock_ = -1;
-    if (state == CONNECTED || state == CONNECTING) state = IDLE;
+    if (state != FAILED) state = IDLE;
 }
 
-float NetClient::serverTimeEstimate() const {
-    double since = std::min(0.25, nowSeconds() - latestRecvTime);
-    return latestServerTick * TICK_DT + (float)since;
-}
-
-uint32_t NetClient::nextCmdTick() {
-    double est = latestServerTick + (nowSeconds() - latestRecvTime) / TICK_DT + (rttMs * 0.001 * 0.5) / TICK_DT + 2.0;
-    uint32_t t = (uint32_t)std::max(0.0, est + 0.5);
-    if (lastCmdTick == 0 || t > lastCmdTick + 12) lastCmdTick = t;
-    else lastCmdTick = lastCmdTick + 1;
-    return lastCmdTick;
-}
-
-void NetClient::sendCmd(const UserCmd& c) {
-    (void)c;
+void NetClient::sendCommand(const Command& c) {
     if (state != CONNECTED) return;
-    Writer wr; wr.header(PK_CMDS);
-    wr.u32(lastSnapSeq); wr.u32(lastEventSeq); wr.u16((uint16_t)std::min(rttMs, 65000));
-    int cnt = (int)std::min<size_t>(pending.size(), 4);
-    wr.u8((uint8_t)cnt);
-    for (size_t i = pending.size() - cnt; i < pending.size(); i++) {
-        const UserCmd& u = pending[i];
-        wr.u32(u.tick); wr.f32(u.yaw); wr.f32(u.pitch);
-        wr.i8((int8_t)clampf(u.fwd * 127, -127, 127)); wr.i8((int8_t)clampf(u.side * 127, -127, 127));
-        wr.u16((uint16_t)u.buttons); wr.u8(u.select); wr.u32(u.viewTick);
+    Writer w;
+    writeCommand(w, c);
+    unacked.push_back({++cmdSeq, w.b});
+    flush();
+}
+
+void NetClient::flush() {
+    if (sock_ < 0) return;
+    Writer w;
+    w.u32(NET_MAGIC); w.u8(P_INPUT); w.u32(lastSnap); w.u32(lastEvent); w.f32((float)fmod(nowSeconds(), 100000.0));
+    int cnt = 0;
+    size_t countPos = w.b.size();
+    w.u8(0);
+    for (auto& u : unacked) {
+        if (w.b.size() + u.second.size() + 4 > 1200) break;
+        w.u32(u.first);
+        w.b.insert(w.b.end(), u.second.begin(), u.second.end());
+        cnt++;
     }
-    sock::sendTo(sock_, server, wr.b.data(), (int)wr.b.size());
+    w.b[countPos] = (uint8_t)cnt;
+    sock::sendTo(sock_, server, w.b.data(), (int)w.b.size());
+    lastSend = nowSeconds();
 }
 
-void NetClient::sendBuy(int item) {
-    if (state != CONNECTED) return;
-    Writer wr; wr.header(PK_BUY); wr.i16((int16_t)item); wr.u32(buyNonce++);
-    for (int i = 0; i < 3; i++) sock::sendTo(sock_, server, wr.b.data(), (int)wr.b.size());
+float NetClient::alpha() const {
+    if (lastSnapTime <= 0) return 1;
+    return clampf((float)((nowSeconds() - lastSnapTime) / snapInterval), 0, 1);
 }
 
-void NetClient::predict(World& cw, const UserCmd& c) {
-    if (state != CONNECTED) return;
-    UserCmd cmd = c;
-    pending.push_back(cmd);
-    while (pending.size() > 256) pending.pop_front();
-    sendTimes[cmd.tick] = nowSeconds();
-    if (sendTimes.size() > 512) sendTimes.erase(sendTimes.begin());
-    sendCmd(cmd);
-    if (localId < 0 || !cw.players[localId].alive) return;
-    Player& p = cw.players[localId];
-    p.prevPos = p.pos; p.prevDuck = p.duck;
-    cw.time = cmd.tick * TICK_DT;
-    cw.tick = cmd.tick;
-    cw.collectEvents = true;
-    cw.predictPlayer(localId, cmd);
-}
-
-bool NetClient::update(World& cw, std::vector<GameEvent>& eventsOut) {
+bool NetClient::update(World& cw, std::vector<GameEvent>& out) {
     if (sock_ < 0) return false;
     double now = nowSeconds();
-    bool reinit = false;
+    bool initialised = false;
     if (state == CONNECTING) {
-        if (now - lastConnectSend > 0.5) {
-            lastConnectSend = now;
-            Writer wr; wr.header(PK_CONNECT); wr.u32(NET_VERSION); wr.str(name.c_str(), 24);
-            sock::sendTo(sock_, server, wr.b.data(), (int)wr.b.size());
+        if (now - lastSend > 0.5) {
+            Writer w; w.u32(NET_MAGIC); w.u8(P_HELLO); w.u32(NET_VERSION); w.str(name.c_str(), 24); w.u8((uint8_t)hero);
+            sock::sendTo(sock_, server, w.b.data(), (int)w.b.size());
+            lastSend = now;
         }
-        if (now - connectStart > 8.0) { state = FAILED; reason = "Le serveur ne repond pas"; return false; }
+        if (now - connectStart > 8) { state = FAILED; reason = "Aucune réponse du serveur (adresse, port UDP ou pare-feu ?)"; return false; }
     }
-    uint8_t buf[8192];
+    uint8_t buf[4096];
     sock::Addr from;
     int n;
     while ((n = sock::recvFrom(sock_, from, buf, sizeof buf)) > 0) {
@@ -398,179 +448,196 @@ bool NetClient::update(World& cw, std::vector<GameEvent>& eventsOut) {
         if (r.u32() != NET_MAGIC) continue;
         uint8_t type = r.u8();
         lastHeard = now;
-        if (type == PK_ACCEPT && state == CONNECTING) {
-            localId = r.u8();
-            mode = (GameMode)r.u8();
-            int rtw = r.u8(); int rt = r.u16(); int bt = r.u16(); int ft = r.u16();
-            uint32_t st = r.u32();
-            cw.init(mode);
-            cw.clientSide = true;
-            cw.roundsToWin = rtw; cw.roundTimeSec = (float)rt; cw.buyTimeSec = (float)bt; cw.freezeTimeSec = (float)ft;
-            latestServerTick = st; latestRecvTime = now;
-            state = CONNECTED;
-            reinit = true;
-        } else if (type == PK_REJECT) {
-            char rs[48]; r.str(rs, 48);
-            state = FAILED; reason = rs;
-        } else if (type == PK_KICK) {
-            char rs[48]; r.str(rs, 48);
-            state = DISCONNECTED; reason = rs;
-        } else if (type == PK_SNAP && state == CONNECTED) {
-            applySnapshot(cw, buf + 5, n - 5, eventsOut);
-        }
-    }
-    if (state == CONNECTED && now - lastHeard > 8.0) { state = DISCONNECTED; reason = "Connexion perdue"; }
-    return reinit;
-}
-
-static bool isPredictedEvent(EvType t) {
-    switch (t) {
-    case EV_SHOT: case EV_IMPACT: case EV_RELOAD: case EV_DRAW: case EV_DRYFIRE: case EV_SCOPE:
-    case EV_KNIFE_SWING: case EV_JUMP: case EV_LAND: case EV_FOOTSTEP: case EV_NADE_THROW: case EV_PLANT_START:
-        return true;
-    default: return false;
-    }
-}
-
-void NetClient::applySnapshot(World& cw, const uint8_t* d, int n, std::vector<GameEvent>& eventsOut) {
-    Reader r(d, n);
-    uint32_t seq = r.u32();
-    uint32_t tick = r.u32();
-    uint32_t ackCmd = r.u32();
-    if (seq <= lastSnapSeq) return;
-    snapsExpected += (int)(seq - lastSnapSeq);
-    snapsReceived++;
-    if (snapsExpected > 200) { lossPct = 100.f * (1.f - (float)snapsReceived / snapsExpected); snapsExpected = snapsReceived = 0; }
-    lastSnapSeq = seq;
-    latestServerTick = tick;
-    latestRecvTime = nowSeconds();
-    float st = tick * TICK_DT;
-    if (sendTimes.count(ackCmd)) {
-        int sample = (int)((nowSeconds() - sendTimes[ackCmd]) * 1000.0);
-        rttMs = rttMs == 0 ? sample : (rttMs * 7 + sample) / 8;
-    }
-    // ---- game state
-    cw.mode = (GameMode)r.u8(); cw.phase = (Phase)r.u8();
-    cw.phaseEnd = st + r.f32(); cw.roundStartTime = st + r.f32(); cw.buyEndTime = st + r.f32();
-    cw.round = r.u8(); cw.squadScore[0] = r.u8(); cw.squadScore[1] = r.u8();
-    cw.squadSide[0] = (Team)r.u8(); cw.squadSide[1] = (Team)r.u8(); cw.overtime = r.u8() != 0; cw.matchWinnerSquad = r.i8();
-    cw.lastMvp = r.i8(); cw.lastWinner = (Team)r.u8(); cw.lastReason = (RoundEndReason)r.u8(); cw.dmEndTime = st + r.f32(); cw.roundsToWin = r.u8();
-    int hc = r.u8();
-    cw.history.clear();
-    for (int i = 0; i < hc; i++) { uint8_t v = r.u8(); cw.history.push_back({(Team)(v & 3), (RoundEndReason)((v >> 2) & 7), (v >> 5) & 1}); }
-    cw.bomb.state = (BombState)r.u8(); cw.bomb.carrier = r.i8(); cw.bomb.pos = r.v3(); cw.bomb.explodeTime = st + r.f32();
-    cw.bomb.defuser = r.i8(); cw.bomb.defuseStart = st + r.f32(); cw.bomb.defuseEnd = st + r.f32(); cw.bomb.site = r.u8();
-    // ---- players
-    SnapRecord rec{};
-    rec.tick = tick;
-    int cnt = r.u8();
-    bool seen[MAX_PLAYERS] = {false};
-    for (int i = 0; i < cnt && !r.bad; i++) {
-        int id = r.u8();
-        if (id >= MAX_PLAYERS) { r.bad = true; break; }
-        Player& p = cw.players[id];
-        seen[id] = true;
-        uint8_t f1 = r.u8(), f2 = r.u8();
-        bool wasAlive = p.alive;
-        p.active = true; p.id = id;
-        p.alive = f1 & 1; p.isBot = f1 & 2; p.onGround = f1 & 4; p.hasBomb = f1 & 8; p.kit = f1 & 16; p.helmet = f1 & 32;
-        p.defusing = f1 & 64; p.planting = f1 & 128; p.reloading = f2 & 1; p.pinPulled = f2 & 2; p.isRemote = f2 & 4;
-        p.team = (Team)r.u8(); p.squad = r.u8();
-        r.str(p.name, 16);
-        Vector3 pos = r.v3(), vel = r.v3();
-        float yaw = r.f32(), pitch = r.f32(), duck = r.u8() / 255.f;
-        p.health = r.u8(); p.armor = r.u8(); p.money = r.u16();
-        WeaponId aw = (WeaponId)r.u8();
-        p.primary = (WeaponId)r.u8(); p.secondary = (WeaponId)r.u8();
-        uint8_t nd = r.u8();
-        p.nades[0] = nd & 3; p.nades[1] = (nd >> 2) & 3; p.nades[2] = (nd >> 4) & 3; p.nades[3] = (nd >> 6) & 3;
-        int scope = r.u8();
-        p.kills = r.i16(); p.deaths = r.i16(); p.assists = r.i16(); p.headshots = r.i16(); p.damage = r.i16(); p.mvps = r.i16(); p.score = r.i16(); p.ping = r.u16();
-        p.clip[0] = r.i16(); p.clip[1] = r.i16(); p.reserve[0] = r.i16(); p.reserve[1] = r.i16();
-        float flashEnd = st + r.f32(); p.flashDur = r.f32();
-        float punchYaw = r.f32(), punchPitch = r.f32();
-        if (id == localId) {
-            float base = ackCmd * TICK_DT;
-            p.pos = pos; p.vel = vel; p.duck = duck;
-            if (!wasAlive && p.alive) { p.yaw = yaw; p.pitch = pitch; }
-            p.activeW = aw; p.scope = scope;
-            p.punchYaw = punchYaw; p.punchPitch = punchPitch;
-            p.nextAttack = base + r.f32(); p.drawEnd = base + r.f32(); p.reloadEnd = base + r.f32(); p.lastShotTime = base + r.f32();
-            p.plantStart = base + r.f32(); p.inspectUntil = base + r.f32();
-            p.spreadAccum = r.f32(); p.shotsFired = r.u8(); p.scopeResume = r.u8(); p.stamina = r.f32();
-            uint8_t hb = r.u8();
-            p.attackHeld = hb & 1; p.attack2Held = hb & 2; p.jumpHeld = hb & 4; p.dropHeld = hb & 8;
-            p.lastW = (WeaponId)r.u8(); p.throwStrength = r.u8(); p.stepAccum = r.f32(); p.tagUntil = base + r.f32(); p.tagAmount = r.f32();
-            p.flashEnd = flashEnd;
-            // drop acknowledged commands, replay the rest (reconciliation)
-            while (!pending.empty() && pending.front().tick <= ackCmd) pending.pop_front();
-            if (p.alive) {
-                bool ce = cw.collectEvents;
-                cw.collectEvents = false;
-                for (auto& c : pending) { cw.time = c.tick * TICK_DT; cw.tick = c.tick; cw.predictPlayer(id, c); }
-                cw.collectEvents = ce;
+        if (type == P_REJECT) { char why[64]; r.str(why, 64); state = FAILED; reason = why; return false; }
+        if (type == P_BYE) { state = DISCONNECTED; reason = "Le serveur a fermé la partie"; return false; }
+        if (type == P_WELCOME) {
+            if (state == CONNECTING) {
+                localPlayer = r.u8();
+                state = CONNECTED;
+                cw = World{};
+                cw.setup(1);
+                cw.clientSide = true;
+                initialised = true;
             }
-            p.prevPos = p.pos; p.prevDuck = p.duck;
-        } else {
-            p.vel = vel; p.activeW = aw; p.scope = scope; p.punchYaw = punchYaw; p.punchPitch = punchPitch; p.flashEnd = flashEnd;
-            rec.p[id] = {pos, yaw, pitch, duck, p.alive, vel};
-            rec.valid[id] = true;
-            if (!wasAlive && p.alive) { p.pos = p.prevPos = pos; p.yaw = yaw; p.pitch = pitch; }
+            continue;
+        }
+        if (type == P_SNAP && state == CONNECTED) {
+            uint32_t seq = r.u32();
+            int chunk = r.u8(), chunks = r.u8();
+            if (seq <= lastSnap || chunks == 0) continue;
+            if (seq != g_cx.assemblingSeq) {
+                if (seq < g_cx.assemblingSeq) continue;
+                g_cx.assemblingSeq = seq; g_cx.chunksExpected = chunks; g_cx.chunksGot = 0;
+                g_cx.parts.assign(chunks, {});
+            }
+            if (chunk >= (int)g_cx.parts.size() || !g_cx.parts[chunk].empty()) continue;
+            g_cx.parts[chunk].assign(buf + r.i, buf + n);
+            if (g_cx.parts[chunk].empty()) g_cx.parts[chunk].push_back(0);
+            if (++g_cx.chunksGot == g_cx.chunksExpected) {
+                std::vector<uint8_t> all;
+                for (auto& p : g_cx.parts) all.insert(all.end(), p.begin(), p.end());
+                lastSnap = seq;
+                double dtSnap = lastSnapTime > 0 ? now - lastSnapTime : snapInterval;
+                snapInterval = clampf((float)(snapInterval * 0.85 + dtSnap * 0.15), 1.0f / 40, 0.25f);
+                lastSnapTime = now;
+                mapChanged = false;
+                applySnapshot(cw, all.data(), (int)all.size(), out);
+                if (mapChanged) initialised = true;
+            }
         }
     }
-    for (int i = 0; i < MAX_PLAYERS; i++) if (!seen[i]) cw.players[i].active = false;
-    snaps.push_back(rec);
-    while (snaps.size() > 64) snaps.pop_front();
-    // ---- world entities
-    int ns = r.u8();
-    cw.smokes.clear();
-    for (int i = 0; i < ns && !r.bad; i++) { SmokeCloud s; s.active = true; s.pos = r.v3(); s.start = st + r.f32(); s.end = st + r.f32(); cw.smokes.push_back(s); }
-    int nf = r.u8();
-    cw.fires.clear();
-    for (int i = 0; i < nf && !r.bad; i++) { FireArea f; f.active = true; f.pos = r.v3(); f.start = st + r.f32(); f.end = st + r.f32(); f.radius = r.f32(); cw.fires.push_back(f); }
-    int np = r.u8();
-    cw.projectiles.clear();
-    for (int i = 0; i < np && !r.bad; i++) { Projectile pr; pr.active = true; pr.type = (WeaponId)r.u8(); pr.pos = pr.prevPos = r.v3(); cw.projectiles.push_back(pr); }
-    int nd = r.u8();
-    cw.drops.clear();
-    for (int i = 0; i < nd && !r.bad; i++) { DroppedWeapon dw; dw.active = true; dw.w = (WeaponId)r.u8(); dw.pos = r.v3(); dw.spawnTime = st + r.f32(); dw.resting = true; cw.drops.push_back(dw); }
-    // ---- events
-    uint32_t first = r.u32();
-    int ne = r.u8();
-    for (int i = 0; i < ne && !r.bad; i++) {
-        GameEvent e = readEvent(r);
-        if (r.bad) break;
-        uint32_t s = first + i;
-        if (s <= lastEventSeq) continue;
-        lastEventSeq = s;
-        if (e.a == localId && localId >= 0 && isPredictedEvent(e.type)) continue;
-        eventsOut.push_back(e);
+    if (state == CONNECTED) {
+        if (now - lastHeard > TIMEOUT) { state = DISCONNECTED; reason = "Connexion au serveur perdue"; return initialised; }
+        if (now - lastSend > 1.0 / 30) flush();
     }
+    return initialised;
 }
 
-void NetClient::interpolate(World& cw) {
-    if (snaps.empty()) return;
-    float rt = serverTimeEstimate() - g_settings.interpMs * 0.001f;
-    const SnapRecord* a = &snaps.front();
-    const SnapRecord* b = &snaps.back();
-    for (size_t i = 0; i + 1 < snaps.size(); i++) {
-        if (snaps[i].tick * TICK_DT <= rt && snaps[i + 1].tick * TICK_DT >= rt) { a = &snaps[i]; b = &snaps[i + 1]; break; }
+void NetClient::applySnapshot(World& cw, const uint8_t* d, int n, std::vector<GameEvent>& out) {
+    Reader r(d, n);
+    cw.tick = r.u32();
+    int mid = r.u8();
+    if (mid != cw.mapId || cw.map.vheight.empty()) {
+        cw.mapId = mid; cw.map.generate(mid);
+        cw.ents.clear(); cw.ents.resize(1);
+        for (int t = 0; t < 2; t++) { cw.vis[t].assign(Map::N * Map::N, 0); cw.explored[t].assign(Map::N * Map::N, 0); }
+        mapChanged = true;
     }
-    if (rt > snaps.back().tick * TICK_DT) a = b = &snaps.back();
-    float span = (b->tick - a->tick) * TICK_DT;
-    float t = span > 0 ? clampf((rt - a->tick * TICK_DT) / span, 0, 1) : 1;
-    cw.time = serverTimeEstimate();
-    cw.tick = (uint32_t)(cw.time / TICK_DT);
+    cw.time = r.f32();
+    Phase ph = (Phase)r.u8();
+    cw.winner = (int8_t)r.u8();
+    cw.lobbyEnd = cw.time + r.f32();
+    uint32_t ackCmd = r.u32();
+    float echo = r.f32();
+    if (echo > 0) { float rtt = (float)fmod(nowSeconds(), 100000.0) - echo; if (rtt >= 0 && rtt < 5) rttMs = (int)(rtt * 1000); }
+    while (!unacked.empty() && unacked.front().first <= ackCmd) unacked.pop_front();
+    cw.titanBuffUntil[0] = cw.time + r.f32(); cw.titanBuffUntil[1] = cw.time + r.f32(); cw.nextWave = cw.time + r.f32();
+    cw.core[0] = r.u16(); cw.core[1] = r.u16();
+    struct HeroInfo { uint16_t id; int level, k, de, as, lh; uint8_t items[4]; float respawn; };
+    HeroInfo hi[MAX_PLAYERS] = {};
     for (int i = 0; i < MAX_PLAYERS; i++) {
-        if (i == localId || !cw.players[i].active) continue;
-        if (!a->valid[i] || !b->valid[i]) { if (b->valid[i]) { cw.players[i].pos = cw.players[i].prevPos = b->p[i].pos; } continue; }
-        Player& p = cw.players[i];
-        p.pos = lerp3(a->p[i].pos, b->p[i].pos, t);
-        p.prevPos = p.pos;
-        p.yaw = a->p[i].yaw + angleDiff(b->p[i].yaw, a->p[i].yaw) * t;
-        p.pitch = lerpf(a->p[i].pitch, b->p[i].pitch, t);
-        p.duck = p.prevDuck = lerpf(a->p[i].duck, b->p[i].duck, t);
+        PlayerState& p = cw.players[i];
+        uint8_t f = r.u8();
+        p.active = f & 1; p.isAI = (f & 2) != 0; p.ready = (f & 4) != 0;
+        if (!p.active) continue;
+        r.str(p.name, 24); p.team = r.u8(); p.hero = (UnitType)r.u8(); p.heroId = r.u16();
+        p.gold = r.u16();
+        p.flux = r.u16();
+        p.upgrades[0] = r.u8(); p.upgrades[1] = r.u8();
+        p.goldEarned = (int)r.u32(); p.unitsProduced = r.u16(); p.unitsKilled = r.u16(); p.unitsLost = r.u16(); p.actions = (int)r.u32();
+        p.ping = r.u16();
+        hi[i].id = p.heroId; hi[i].level = r.u8(); hi[i].k = r.u16(); hi[i].de = r.u16(); hi[i].as = r.u16(); hi[i].lh = r.u16();
+        for (int k = 0; k < 4; k++) hi[i].items[k] = r.u8();
+        hi[i].respawn = r.f32();
     }
+    int team = localPlayer >= 0 ? cw.players[localPlayer].team : 0;
+    size_t total = r.u16();
+    if (cw.ents.size() < total) cw.ents.resize(total);
+    for (size_t i = 0; i < cw.ents.size(); i++) cw.ents[i].id = (uint16_t)i;
+    std::vector<uint8_t> seen(cw.ents.size(), 0);
+    int cnt = r.u16();
+    for (int k = 0; k < cnt && !r.bad; k++) {
+        uint16_t id = r.u16();
+        if (id >= cw.ents.size()) { r.bad = true; break; }
+        Entity& e = cw.ents[id];
+        seen[id] = 1;
+        UnitType t = (UnitType)r.u8();
+        bool fresh = !e.alive || e.type != t;
+        const UnitDef& def = unitDef(t);
+        int8_t owner = (int8_t)r.u8(); uint8_t eteam = r.u8();
+        Vector2 np = r.pos();
+        if (fresh) {
+            if (e.alive && (e.kind == K_BUILDING || e.kind == K_TOWER || e.kind == K_RESOURCE)) cw.map.setBlocked(e.pos, std::max(1, unitDef(e.type).footprint), 0);
+            e = Entity{};
+            e.id = id; e.radius = def.radius; e.alive = true;
+            e.pos = e.prevPos = np;
+            if (def.kind == K_BUILDING || def.kind == K_TOWER || def.kind == K_RESOURCE) cw.map.setBlocked(np, std::max(1, def.footprint), def.kind == K_RESOURCE ? 3 : 2);
+        } else { e.prevPos = e.pos; e.pos = np; }
+        e.type = t; e.kind = def.kind; e.owner = owner; e.team = eteam;
+        e.facing = r.u8() / 255.f * 6.2831853f;
+        e.hp = r.f32(); e.maxHp = r.f32();
+        uint16_t f = r.u16();
+        e.attackAnim = cw.time - r.u8() / 100.f;
+        e.constructing = f & 1;
+        float st = cw.time + 0.35f;
+        e.stunUntil = (f & 2) ? st : 0; e.slowUntil = (f & 4) ? st : 0; e.stealthUntil = (f & 8) ? st : 0;
+        e.hasteUntil = (f & 16) ? st : 0; e.dmgUntil = (f & 32) ? st : 0;
+        e.summoned = (f & 1024) != 0;
+        if (f & 1) e.buildProgress = r.u8() / 255.f * def.buildTime;
+        if (f & 64) { e.shield = r.f32(); e.shieldUntil = st; } else e.shield = 0;
+        if (f & 2048) { e.amount = r.u16(); e.rich = r.u8() != 0; }
+        e.carryFlux = (f & 4096) != 0;
+        e.carry = (f & 128) ? 1 : 0;
+        if (f & 512) {
+            e.mana = r.f32(); e.maxMana = r.f32(); e.level = r.u8();
+            for (int q = 0; q < 4; q++) e.items[q] = r.u8();
+        }
+        if (f & 256) {
+            e.order.type = (OrderType)r.u8(); e.order.pt = r.pos(); e.order.target = r.u16();
+            e.hasRally = r.u8() != 0; e.rally = r.pos();
+            int np2 = r.u8();
+            e.prod.clear();
+            for (int q = 0; q < np2; q++) e.prod.push_back((UnitType)r.u8());
+            e.prodProgress = r.f32();
+            e.research = (int8_t)r.u8(); e.researchProgress = r.f32();
+            e.carry = r.u16(); e.gatherTimer = r.f32();
+            if (e.kind == K_HERO) { e.xp = (int)r.u32(); for (int q = 0; q < 4; q++) e.abilCd[q] = r.f32(); }
+        }
+    }
+    // entities that vanished: dead if we can see their spot, otherwise remembered (structures) or hidden
+    cw.updateVision();
+    for (size_t i = 1; i < cw.ents.size(); i++) {
+        Entity& e = cw.ents[i];
+        if (!e.alive || (i < seen.size() && seen[i])) continue;
+        bool structure = e.kind == K_BUILDING || e.kind == K_TOWER || e.kind == K_RESOURCE;
+        if (structure && e.team != team && !cw.cellVisible(team, e.pos)) continue;   // last known state
+        if (structure) cw.map.setBlocked(e.pos, std::max(1, unitDef(e.type).footprint), 0);
+        e.alive = false;
+    }
+    // hero stats are public (scoreboard)
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (!cw.players[i].active || hi[i].id == 0) continue;
+        if (cw.ents.size() <= hi[i].id) cw.ents.resize(hi[i].id + 1);
+        Entity& h = cw.ents[hi[i].id];
+        h.id = hi[i].id; h.kind = K_HERO; h.type = cw.players[i].hero; h.owner = (int8_t)i; h.team = cw.players[i].team;
+        if (h.radius <= 0) h.radius = unitDef(h.type).radius;
+        h.level = hi[i].level; h.kills = hi[i].k; h.deaths = hi[i].de; h.assists = hi[i].as; h.lastHits = hi[i].lh;
+        for (int q = 0; q < 4; q++) h.items[q] = hi[i].items[q];
+        h.respawnAt = hi[i].respawn > 0 ? cw.time + hi[i].respawn : 0;
+        if (h.maxHp <= 1) h.maxHp = h.hp = unitDef(h.type).hp;
+    }
+    // projectiles & zones
+    cw.projs.clear();
+    int np = r.u16();
+    for (int k = 0; k < np && !r.bad; k++) {
+        Projectile p;
+        p.pos = r.pos(); p.dir.x = r.f32(); p.dir.y = r.f32(); p.height = r.u8() / 40.f; p.visual = r.u8(); p.team = r.u8(); p.speed = r.f32(); p.srcType = (UnitType)r.u8();
+        cw.projs.push_back(p);
+    }
+    cw.zones.clear();
+    int nz = r.u16();
+    for (int k = 0; k < nz && !r.bad; k++) {
+        Zone z;
+        z.kind = (ZoneKind)r.u8(); z.pos = r.pos(); z.radius = r.f32(); z.start = cw.time + r.f32(); z.end = cw.time + r.f32(); z.delay = r.f32(); z.team = r.u8(); z.fired = r.u8() != 0;
+        cw.zones.push_back(z);
+    }
+    uint32_t newest = r.u32();
+    int ne = r.u16();
+    for (int k = 0; k < ne && !r.bad; k++) {
+        uint32_t seq;
+        GameEvent e = readEvent(r, seq);
+        if (r.bad) break;
+        if (seq <= lastEvent) continue;
+        if (!cosmetic(e.type)) lastEvent = seq;
+        out.push_back(e);
+    }
+    // cosmetic-only gaps are not resent, so acknowledge up to what we were told when nothing reliable is pending
+    if (ne == 0 || lastEvent < newest) {
+        bool pendingReliable = false;
+        (void)pendingReliable;
+        if (ne < 250) lastEvent = std::max(lastEvent, newest);
+    }
+    if (cw.phase != ph) cw.phase = ph;
 }
 
 } // namespace ax

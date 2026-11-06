@@ -1,79 +1,81 @@
-// map.h : tile based world geometry, collision, ballistics raycast and navigation
+// map.h : RTS battlefields (several layouts), elevation, expansions, navigation grid and flow fields
 #pragma once
 #include "common.h"
+#include <unordered_map>
 
 namespace ax {
 
-enum Material : uint8_t { MAT_NONE = 0, MAT_CONCRETE, MAT_WOOD, MAT_METAL, MAT_FLOOR };
+enum CellType : uint8_t { CELL_GROUND, CELL_ROCK, CELL_PATH, CELL_WATER, CELL_BASE0, CELL_BASE1, CELL_GRASS, CELL_HIGH, CELL_RAMP };
 
-enum ZoneFlags : uint8_t {
-    ZONE_SITE_A = 1, ZONE_SITE_B = 2, ZONE_SPAWN_ATK = 4, ZONE_SPAWN_DEF = 8, ZONE_BUY_ATK = 16, ZONE_BUY_DEF = 32
+struct FlowField {
+    std::vector<float> dist;
+    int goal = -1;
+    int version = -1;
+    uint32_t lastUse = 0;
 };
 
-struct Tile {
-    float height = 0;      // solid from 0 to height (0 = plain floor)
-    Material mat = MAT_FLOOR;
-    uint8_t zone = 0;
-    bool walkableNav = true;  // used by bots
-    char ch = '.';
+// a base location: where a Core / Centre goes, with its crystal fields and flux vents
+struct Expansion {
+    Vector2 hub{};
+    Vector2 dir{};                       // from the hub towards its resources
+    std::vector<Vector2> crystals;
+    std::vector<Vector2> geysers;
+    bool rich = false;
+    int mainOf = -1;                     // team whose starting base this is, -1 otherwise
 };
 
-struct RayHit {
-    bool hit = false;
-    float t = 0;            // distance along ray
-    Vector3 pos{}, normal{};
-    Material mat = MAT_NONE;
-    int tx = -1, tz = -1;
-};
-
-// A solid segment crossed by a ray (for wall penetration)
-struct SolidSpan { float tIn, tOut; Material mat; Vector3 nIn; };
-
-struct HoldSpot { Vector3 pos; float yaw; uint8_t zone; };  // bot defensive spots
+struct MapInfo { const char* name; const char* desc; };
+constexpr int MAP_COUNT = 4;
+const MapInfo& mapInfo(int id);
 
 class Map {
 public:
-    static constexpr float TILE = 2.0f;
-    int w = 0, h = 0;
-    std::vector<Tile> tiles;
-    std::string name;
-    std::vector<Vector3> spawnAtk, spawnDef;
-    std::vector<HoldSpot> holdA, holdB, holdMid;
-    Vector3 siteA{}, siteB{};
-    std::vector<Vector3> routeA, routeB;   // intermediate waypoints for attack routes
+    static constexpr float CELL = 2.0f;
+    static constexpr int N = 100;           // 100 x 100 cells = 200 x 200 m
+    static constexpr float SIZE = N * CELL;
+    static constexpr float HIGH = 2.4f;     // height of the high ground plateaus
 
-    void loadCitadel();
-    void loadAimArena();
+    int id = 0;
+    std::vector<uint8_t> type;              // CellType
+    std::vector<uint8_t> blocked;           // 1 rock/water, 2 building, 3 resource
+    std::vector<uint8_t> level;             // 0 low ground, 1 high ground (vision)
+    std::vector<float> height;              // rock heights (render + shadows)
+    std::vector<float> ground;              // walkable surface height per cell
+    std::vector<float> vheight;             // (N+1)^2 vertex heights of the ground surface
+    int version = 0;                        // bumps when blocking changes
 
-    bool inBounds(int x, int z) const { return x >= 0 && z >= 0 && x < w && z < h; }
-    const Tile& at(int x, int z) const { static Tile solid{6, MAT_CONCRETE, 0, false, '#'}; return inBounds(x, z) ? tiles[z * w + x] : solid; }
-    Tile& atMut(int x, int z) { return tiles[z * w + x]; }
-    void worldToTile(Vector3 p, int& tx, int& tz) const { tx = (int)floorf(p.x / TILE + w * 0.5f); tz = (int)floorf(p.z / TILE + h * 0.5f); }
-    Vector3 tileCenter(int tx, int tz) const { return {(tx - w * 0.5f + 0.5f) * TILE, 0, (tz - h * 0.5f + 0.5f) * TILE}; }
-    float tileMinX(int tx) const { return (tx - w * 0.5f) * TILE; }
-    float tileMinZ(int tz) const { return (tz - h * 0.5f) * TILE; }
-    float worldSizeX() const { return w * TILE; }
-    float worldSizeZ() const { return h * TILE; }
+    Vector2 base[2];                        // starting Core positions
+    Vector2 ramp[2];                        // bottom of each main ramp (army rally)
+    Vector2 rampTop[2];
+    std::vector<Expansion> expansions;
+    std::vector<Vector2> camps;             // neutral camp centres
+    std::vector<Vector2> beacons;           // watch beacons (vision when a unit stands next to them)
+    Vector2 titanPos{100, 100};
+    float baseRadius = 20;
 
-    // Highest floor/solid top under an AABB footprint (ignoring tiles taller than maxTop)
-    float groundHeightAt(Vector3 pos, float radius, float maxTop) const;
-    // Does an AABB (feet pos, radius, height) overlap solid geometry?
-    bool boxBlocked(Vector3 feet, float radius, float height) const;
-    uint8_t zoneAt(Vector3 p) const { int x, z; worldToTile(p, x, z); return at(x, z).zone; }
+    void generate(int mapId);
+    bool inside(int cx, int cz) const { return cx >= 0 && cz >= 0 && cx < N && cz < N; }
+    int cellIndex(Vector2 p) const { int cx = (int)floorf(p.x / CELL), cz = (int)floorf(p.y / CELL); return inside(cx, cz) ? cz * N + cx : -1; }
+    Vector2 cellCenter(int idx) const { return {(idx % N + 0.5f) * CELL, (idx / N + 0.5f) * CELL}; }
+    bool walkable(Vector2 p) const { int i = cellIndex(p); return i >= 0 && !blocked[i]; }
+    bool walkableCell(int cx, int cz) const { return inside(cx, cz) && !blocked[cz * N + cx]; }
+    bool lineClear(Vector2 a, Vector2 b) const;
+    Vector2 nearestWalkable(Vector2 p) const;
+    int teamOfBase(Vector2 p) const;        // -1 if not inside a starting base
+    int levelAt(Vector2 p) const { int i = cellIndex(p); return i >= 0 ? level[i] : 0; }
+    float groundHeight(Vector2 p) const;    // smooth surface height (render)
+    bool canPlace(Vector2 center, int footprint) const;   // footprint free of obstacles
+    bool nearResources(Vector2 center, int footprint, float margin) const;
+    void setBlocked(Vector2 center, int footprint, uint8_t v);
+    Vector2 snapBuilding(Vector2 p, int footprint) const;
 
-    // Ballistic raycast against geometry. Returns first hit within maxDist.
-    RayHit raycast(Vector3 o, Vector3 dir, float maxDist) const;
-    // Collect all solid spans along a ray (sorted) - used by bullet penetration
-    void raySpans(Vector3 o, Vector3 dir, float maxDist, std::vector<SolidSpan>& out) const;
-    bool lineOfSight(Vector3 a, Vector3 b) const;
-
-    // Navigation (A* on tiles, 8-connected)
-    bool findPath(Vector3 from, Vector3 to, std::vector<Vector3>& out) const;
-    bool tileWalkable(int x, int z) const;
-    Vector3 randomWalkableNear(Vector3 p, float radius, Rng& rng) const;
-
-    // Render mesh (built once)
-    Mesh buildMesh() const;
+    // flow fields
+    Vector2 flowDirection(Vector2 from, Vector2 goal, float goalRadius);
+    float flowDistance(Vector2 from, Vector2 goal);
+    uint32_t frame = 0;
+private:
+    std::unordered_map<long long, FlowField> flows;
+    FlowField& getFlow(int goalCell, float radius);
 };
 
 } // namespace ax

@@ -1,43 +1,56 @@
-// hud.h : in-game heads-up display, buy menu, scoreboard, radar
+// hud.h : RTS/MOBA interface
 #pragma once
-#include "world.h"
-#include "render.h"
+#include "sim.h"
 
 namespace ax {
 
-struct KillFeedEntry { std::string killer, victim; Team kt, vt; WeaponId w; uint8_t flags; float time; bool local; bool assistLocal; };
-struct DamageIndicator { float yaw; float time; int amount; };
-struct CenterMsg { std::string text, sub; Color col; float time, dur; };
-struct DamageNumber { Vector3 pos; int value; bool head; float time; };
-
-struct HudState {
-    std::vector<KillFeedEntry> feed;
-    std::vector<DamageIndicator> dmg;
-    std::vector<DamageNumber> numbers;
-    CenterMsg center{};
-    float hitTime = -10; bool hitKill = false; bool hitHead = false;
-    float roundBannerTime = -10; bool roundWon = false; std::string roundReason, roundMvp;
-    float weaponListTime = -10;
-    float frameTimes[160]{}; int ftIdx = 0;
-    int pingMs = 0;
-    float lossPct = 0;
-    float spottedTime[MAX_PLAYERS]{};
-    int buyCategory = 0;
-    float flashWhite = 0;
-    Texture2D radarTex{};
-    bool radarReady = false;
-    float time = 0;
-    void reset() { feed.clear(); dmg.clear(); numbers.clear(); center = CenterMsg{}; hitTime = -10; roundBannerTime = -10; }
+struct CardButton {
+    std::string label, tip;
+    int hotkeyAction = -1;
+    int cost = 0, flux = 0;
+    bool enabled = true;
+    float progress = -1;
 };
 
-void hudBuildRadar(HudState& h, const Map& m);
-void hudOnEvent(HudState& h, const World& w, const GameEvent& e, int localId);
-void hudMessage(HudState& h, const char* text, const char* sub, Color c, float dur = 2.5f);
-void hudDraw(HudState& h, const World& w, int localId, int viewId, const ViewState& v, float dt);
-void drawCrosshair(float cx, float cy, float dynGap, float scale);
-int  hudBuyMenu(HudState& h, const World& w, int localId, bool& close);   // returns item to buy (or -item-1 to sell), 0 = nothing
-void hudScoreboard(const World& w, int localId);
-const char* weaponShortName(WeaponId w);
-const char* buyItemName(int item);
+struct HudInput {
+    int abilityClicked = -1;
+    int cardClicked = -1;
+    int buyItem = 0;
+    int sellSlot = -1;
+    bool minimapLeft = false, minimapRight = false;
+    Vector2 minimapWorld{};
+    uint16_t selectOnly = 0;
+    int cancelQueueIndex = -1;
+    bool overUI = false;
+};
+
+struct HudMsg { std::string text; Color col; float time; };
+struct FeedEntry { std::string text; Color col; float time; };
+
+struct HudState {
+    std::vector<HudMsg> msgs;
+    std::vector<FeedEntry> feed;
+    bool shopOpen = false;
+    Texture2D minimap{};
+    bool minimapReady = false;
+    Image fogImg{};
+    Texture2D fogTex{};
+    float time = 0;
+    float frameTimes[120]{};
+    int ftIdx = 0;
+    int ping = 0;
+    std::vector<Vector2> pings;
+    std::vector<float> pingTimes;
+    Rectangle minimapRect{};
+    void reset() { msgs.clear(); feed.clear(); shopOpen = false; pings.clear(); pingTimes.clear(); }
+};
+
+void hudInit(HudState& h, const World& w);
+void hudMessage(HudState& h, const std::string& s, Color c);
+void hudOnEvent(HudState& h, const World& w, const GameEvent& e, int player);
+void hudDraw(HudState& h, const World& w, int player, const std::vector<uint16_t>& sel, const Camera3D& cam,
+             const std::vector<CardButton>& card, HudInput& in, float dt, int apm, bool aiming);
+void hudScoreboard(const World& w, int player);
+bool mouseOverHud(const HudState& h);
 
 } // namespace ax

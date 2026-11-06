@@ -3,434 +3,488 @@
 
 namespace ax {
 
-// 48x48 tiles of 2m. Generated with tools/mapgen.py
-// # wall  x wood wall  c crate(0.85) k crate(1.35 crouch-jump) C big crate(2.1) w low wall(1.05)
-// 1..4 platforms (0.4m per level)  A/B plant zones  T/D spawns
-static const char* kCitadel[48] = {
-    "################################################",
-    "################################################",
-    "#################......k.......#################",
-    "########...........DDDDDDDDDD...........########",
-    "########................................########",
-    "########..........c..........c..........########",
-    "###.www.....................................3###",
-    "###............44####ww....####.............3###",
-    "###..AAAAAAAAc.44####......####...BBBBBBBBc.3###",
-    "###2.AAAAAAAAk.3.####....c.####...kBBBBBBBc.2###",
-    "###2.AAACCcAAA.2.####......####...BBBkCCBBB.1###",
-    "###1.AAkCCAAAA.1.####..##..####...BBBBCCcBB..###",
-    "###..AAAAAAAAA...####..##..####x..BBBBBBBBB..###",
-    "###..AAAAAAAAA...###........###x..BBBBBBBBB..###",
-    "###..ccAAAAAAA...###.......k###x..BB#BBBBBB..###",
-    "###..AAAAAAAAA...###........###...BBBBBBBwww.###",
-    "###...........www###..c.....###..............###",
-    "###.....##.....#####........#####.....##.....###",
-    "##......##.............ww...#####.....###....###",
-    "##......##.......k.............##.....###....###",
-    "##......##..c..##..............##..k..##......##",
-    "##.c....##.....##.............c.......##......##",
-    "##c.....##..........xxx..xxx..........##......##",
-    "##......############........############......##",
-    "##......############........############.c....##",
-    "##......############........############......##",
-    "####...#############.....ck.############......##",
-    "####...#############........############......##",
-    "##......############c.......############......##",
-    "##......############........############..######",
-    "##......############........############..######",
-    "##......############........############...c..##",
-    "##....CC############........############......##",
-    "##...kCC############.CC.....###############...##",
-    "##......############.CCc....###############...##",
-    "##......############........############......##",
-    "##......############........############....k.##",
-    "##....c.############........############......##",
-    "##.......................................c....##",
-    "##............................................##",
-    "##............................................##",
-    "#####.......ck....................c........#####",
-    "#####......................................#####",
-    "#####.....TTTTTTTTTTTTTTTTTTTTTTTTTTTT.....#####",
-    "#####...................C..................#####",
-    "#####......................................#####",
-    "################################################",
-    "################################################",
+float (*g_groundFn)(Vector2 p) = nullptr;
+
+static const MapInfo kMaps[MAP_COUNT] = {
+    {"FAILLE D'OBSIDIENNE", "Ouest contre est. Naturelles exposées, base riche au sud et au nord."},
+    {"PLATEAUX JUMEAUX", "Nord contre sud. Deux longues routes et des expansions sur les flancs."},
+    {"CRATÈRE DE VESTA", "Bases décalées autour d'un cratère. Bases riches au centre."},
+    {"HAUTE TENSION", "Départs collés au bord. Rush rapide par le centre ou expansion risquée."},
+};
+const MapInfo& mapInfo(int id) { return kMaps[std::clamp(id, 0, MAP_COUNT - 1)]; }
+
+namespace {
+struct BaseDef { Vector2 hub; float dirDeg; bool rich; };
+struct Blob { Vector2 c; float r; };
+struct MapDef {
+    Vector2 main; float dirDeg; float rampDeg;
+    std::vector<BaseDef> bases;                        // team 0 side; mirrored for team 1
+    std::vector<Blob> rocks, lakes;                    // mirrored
+    std::vector<Vector2> camps, beacons;               // mirrored
+    std::vector<std::pair<Vector2, Vector2>> paths;    // mirrored (decoration)
+    std::vector<std::pair<Vector2, Vector2>> ridges;   // mirrored rock walls (chokes)
+    uint32_t seed;
 };
 
-static Tile tileFromChar(char c) {
-    Tile t; t.ch = c;
-    switch (c) {
-    case '#': t.height = 6.0f; t.mat = MAT_CONCRETE; t.walkableNav = false; break;
-    case 'x': t.height = 3.6f; t.mat = MAT_WOOD; t.walkableNav = false; break;
-    case 'c': t.height = 0.85f; t.mat = MAT_WOOD; t.walkableNav = false; break;
-    case 'k': t.height = 1.35f; t.mat = MAT_WOOD; t.walkableNav = false; break;
-    case 'C': t.height = 2.1f; t.mat = MAT_WOOD; t.walkableNav = false; break;
-    case 'w': t.height = 1.05f; t.mat = MAT_CONCRETE; t.walkableNav = false; break;
-    case 'm': t.height = 1.2f; t.mat = MAT_METAL; t.walkableNav = false; break;
-    case '1': case '2': case '3': case '4':
-        t.height = 0.4f * (c - '0'); t.mat = MAT_CONCRETE; t.walkableNav = true; break;
-    case 'A': t.zone = ZONE_SITE_A; break;
-    case 'B': t.zone = ZONE_SITE_B; break;
-    case 'T': t.zone = ZONE_SPAWN_ATK; break;
-    case 'D': t.zone = ZONE_SPAWN_DEF; break;
-    default: break;
+MapDef mapDef(int id) {
+    MapDef d;
+    switch (id) {
+    default:
+    case 0:   // west vs east
+        d.main = {30, 100}; d.dirDeg = 180; d.rampDeg = 300;
+        d.bases = {{{62, 64}, 225, false}, {{32, 30}, 225, false}, {{70, 170}, 135, false}, {{100, 148}, 90, true}};
+        d.rocks = {{{84, 122}, 5}, {{48, 152}, 5}, {{20, 62}, 5}, {{86, 74}, 4}, {{118, 160}, 4}};
+        d.lakes = {{{74, 96}, 5}};
+        d.camps = {{50, 132}, {82, 40}};
+        d.beacons = {{82, 112}};
+        d.paths = {{{43, 83}, {62, 64}}, {{62, 64}, {100, 100}}, {{100, 100}, {100, 148}}, {{62, 64}, {32, 30}}, {{100, 148}, {70, 170}}};
+        d.ridges = {{{84, 42}, {92, 66}}, {{46, 126}, {60, 150}}, {{118, 96}, {128, 118}}};
+        d.seed = 101;
+        break;
+    case 1:   // north vs south
+        d.main = {100, 30}; d.dirDeg = 270; d.rampDeg = 135;
+        d.bases = {{{66, 62}, 200, false}, {{150, 48}, 315, false}, {{28, 100}, 180, false}};
+        d.rocks = {{{100, 72}, 5}, {{70, 100}, 5}, {{120, 64}, 4}, {{46, 128}, 4}};
+        d.lakes = {{{168, 18}, 7}, {{88, 120}, 4}};
+        d.camps = {{122, 76}, {40, 70}};
+        d.beacons = {{60, 100}};
+        d.paths = {{{86, 47}, {66, 62}}, {{66, 62}, {100, 100}}, {{66, 62}, {28, 100}}, {{100, 100}, {150, 48}}};
+        d.ridges = {{{122, 26}, {128, 52}}, {{38, 82}, {54, 78}}, {{84, 92}, {90, 112}}};
+        d.seed = 202;
+        break;
+    case 2:   // offset diagonal around a crater
+        d.main = {42, 150}; d.dirDeg = 135; d.rampDeg = 0;
+        d.bases = {{{86, 160}, 90, false}, {{36, 98}, 180, false}, {{70, 70}, 225, true}};
+        d.rocks = {{{76, 134}, 5}, {{50, 76}, 5}, {{110, 176}, 4}};
+        d.lakes = {{{88, 116}, 5}};
+        d.camps = {{60, 118}, {132, 172}};
+        d.beacons = {{100, 132}};
+        d.paths = {{{64, 148}, {86, 160}}, {{64, 148}, {100, 100}}, {{36, 98}, {64, 148}}, {{100, 100}, {70, 70}}};
+        d.ridges = {{{98, 148}, {104, 174}}, {{52, 98}, {60, 84}}, {{112, 124}, {124, 114}}};
+        d.seed = 303;
+        break;
+    case 3:   // starts against the top / bottom edges
+        d.main = {64, 30}; d.dirDeg = 270; d.rampDeg = 60;
+        d.bases = {{{100, 60}, 300, false}, {{28, 80}, 180, false}, {{150, 30}, 315, false}, {{60, 122}, 135, true}};
+        d.rocks = {{{126, 56}, 5}, {{42, 104}, 4}, {{80, 82}, 4}};
+        d.lakes = {{{74, 98}, 4}};
+        d.camps = {{112, 30}, {90, 118}};
+        d.beacons = {{30, 130}};
+        d.paths = {{{74, 50}, {100, 60}}, {{100, 60}, {100, 100}}, {{74, 50}, {28, 80}}, {{100, 60}, {150, 30}}, {{100, 100}, {60, 122}}};
+        d.ridges = {{{122, 40}, {126, 62}}, {{40, 94}, {54, 98}}, {{80, 128}, {92, 138}}};
+        d.seed = 404;
+        break;
     }
-    return t;
+    return d;
 }
 
-static float yawTo(Vector3 a, Vector3 b) { float y, p; anglesFromDir(b - a, y, p); return y; }
+Vector2 mirror(Vector2 p) { return {Map::SIZE - p.x, Map::SIZE - p.y}; }
+Vector2 dirOf(float deg) { float a = deg * 3.14159265f / 180.f; return {cosf(a), sinf(a)}; }
+}
 
-void Map::loadCitadel() {
-    name = "CITADEL";
-    w = 48; h = 48;
-    tiles.assign(w * h, Tile{});
-    spawnAtk.clear(); spawnDef.clear();
-    for (int z = 0; z < h; z++)
-        for (int x = 0; x < w; x++) tiles[z * w + x] = tileFromChar(kCitadel[z][x]);
+void Map::generate(int mapId) {
+    id = std::clamp(mapId, 0, MAP_COUNT - 1);
+    MapDef D = mapDef(id);
+    const int C = N * N;
+    type.assign(C, CELL_GROUND);
+    blocked.assign(C, 0);
+    level.assign(C, 0);
+    height.assign(C, 0);
+    ground.assign(C, 0);
+    expansions.clear(); camps.clear(); beacons.clear();
+    Rng r(D.seed);
+    std::vector<uint8_t> protect(C, 0);     // cells that must stay open
 
-    // buy zones: BFS distance <= 8 tiles from spawn tiles
-    auto bfsZone = [&](uint8_t spawnFlag, uint8_t buyFlag) {
-        std::vector<int> dist(w * h, -1);
-        std::queue<int> q;
-        for (int i = 0; i < w * h; i++) if (tiles[i].zone & spawnFlag) { dist[i] = 0; q.push(i); }
-        while (!q.empty()) {
-            int i = q.front(); q.pop();
-            tiles[i].zone |= buyFlag;
-            if (dist[i] >= 8) continue;
-            int x = i % w, z = i / w;
-            const int dx[4] = {1, -1, 0, 0}, dz[4] = {0, 0, 1, -1};
-            for (int k = 0; k < 4; k++) {
-                int nx = x + dx[k], nz = z + dz[k];
-                if (!inBounds(nx, nz)) continue;
-                int j = nz * w + nx;
-                if (dist[j] >= 0 || tiles[j].height > 0.5f) continue;
-                dist[j] = dist[i] + 1; q.push(j);
+    auto forCells = [&](Vector2 c, float rad, const std::function<void(int, float)>& f) {
+        int x0 = std::max(0, (int)((c.x - rad) / CELL) - 1), x1 = std::min(N - 1, (int)((c.x + rad) / CELL) + 1);
+        int z0 = std::max(0, (int)((c.y - rad) / CELL) - 1), z1 = std::min(N - 1, (int)((c.y + rad) / CELL) + 1);
+        for (int z = z0; z <= z1; z++)
+            for (int x = x0; x <= x1; x++) {
+                int i = z * N + x;
+                float d = dist2(cellCenter(i), c);
+                if (d < rad) f(i, d);
+            }
+    };
+    auto rock = [&](int i) { if (protect[i]) return; type[i] = CELL_ROCK; blocked[i] = 1; level[i] = 0; };
+    auto open = [&](int i) { if (type[i] == CELL_ROCK || type[i] == CELL_WATER) { type[i] = CELL_GROUND; blocked[i] = 0; } };
+
+    // everything is symmetric by a half turn around the map centre
+    struct Main { Vector2 hub, dir, center, rampDir; };
+    Main mains[2];
+    mains[0].hub = D.main; mains[0].dir = dirOf(D.dirDeg); mains[0].rampDir = dirOf(D.rampDeg);
+    mains[1].hub = mirror(D.main); mains[1].dir = mains[0].dir * -1; mains[1].rampDir = mains[0].rampDir * -1;
+    for (auto& m : mains) m.center = m.hub - m.dir * 3;
+    std::vector<BaseDef> bases;
+    for (auto& b : D.bases) { bases.push_back(b); bases.push_back({mirror(b.hub), b.dirDeg + 180, b.rich}); }
+    for (auto& c : D.camps) { camps.push_back(c); camps.push_back(mirror(c)); }
+    for (auto& b : D.beacons) { beacons.push_back(b); beacons.push_back(mirror(b)); }
+    titanPos = {100, 100};
+
+    // 1. rock formations and lakes (+ small procedural outcrops)
+    std::vector<Blob> rocks, lakes;
+    for (auto& b : D.rocks) { rocks.push_back(b); rocks.push_back({mirror(b.c), b.r}); }
+    for (auto& b : D.lakes) { lakes.push_back(b); lakes.push_back({mirror(b.c), b.r}); }
+    std::vector<Vector2> keyPoints;
+    for (auto& m : mains) keyPoints.push_back(m.hub);
+    for (auto& b : bases) keyPoints.push_back(b.hub);
+    for (auto& c : camps) keyPoints.push_back(c);
+    for (auto& b : beacons) keyPoints.push_back(b);
+    keyPoints.push_back(titanPos);
+    for (int k = 0; k < 9; k++) {
+        Vector2 p = {r.range(14, SIZE - 14), r.range(14, SIZE / 2)};
+        bool ok = true;
+        for (auto& q : keyPoints) if (dist2(p, q) < 20 || dist2(mirror(p), q) < 20) ok = false;
+        for (auto& m : mains) if (dist2(p, m.center) < 34 || dist2(mirror(p), m.center) < 34) ok = false;
+        if (!ok) continue;
+        float rr = r.range(3.0f, 5.0f);
+        rocks.push_back({p, rr}); rocks.push_back({mirror(p), rr});
+    }
+    for (auto& b : rocks)
+        forCells(b.c, b.r * 1.6f, [&](int i, float d) {
+            Vector2 q = cellCenter(i);
+            float wob = b.r * (0.75f + 0.35f * sinf(q.x * 0.9f + b.c.y) * cosf(q.y * 0.7f + b.c.x));
+            if (d < wob) rock(i);
+        });
+    for (auto& rg : D.ridges)
+        for (int m = 0; m < 2; m++) {
+            Vector2 a = m ? mirror(rg.first) : rg.first, b = m ? mirror(rg.second) : rg.second;
+            for (int i = 0; i < C; i++) {
+                Vector2 q = cellCenter(i);
+                float w = 4.4f * (0.88f + 0.14f * sinf(q.x * 0.35f + q.y * 0.5f));
+                if (distPointSeg(q, a, b) < w) rock(i);
             }
         }
-    };
-    bfsZone(ZONE_SPAWN_ATK, ZONE_BUY_ATK);
-    bfsZone(ZONE_SPAWN_DEF, ZONE_BUY_DEF);
+    for (auto& b : lakes)
+        forCells(b.c, b.r * 1.5f, [&](int i, float d) {
+            Vector2 q = cellCenter(i);
+            float wob = b.r * (0.85f + 0.25f * sinf(q.x * 0.6f + q.y * 0.4f));
+            if (d < wob) { type[i] = CELL_WATER; blocked[i] = 1; ground[i] = -0.35f; }
+        });
 
-    for (int x = 11; x <= 36; x += 5) spawnAtk.push_back(tileCenter(x, 43));
-    for (int x = 13; x <= 34; x += 5) spawnAtk.push_back(tileCenter(x, 44));
-    for (int x = 19; x <= 28; x += 2) spawnDef.push_back(tileCenter(x, 3));
-    for (int x = 20; x <= 28; x += 2) spawnDef.push_back(tileCenter(x, 4));
+    // 2. clear the bases, camps, beacons and the titan arena
+    auto clearAround = [&](Vector2 c, float rad) { forCells(c, rad, [&](int i, float) { open(i); ground[i] = 0; protect[i] = 1; }); };
+    for (auto& b : bases) clearAround(b.hub, 13);
+    for (auto& c : camps) clearAround(c, 7);
+    for (auto& b : beacons) clearAround(b, 5);
+    clearAround(titanPos, 9);
 
-    siteA = tileCenter(9, 13);
-    siteB = tileCenter(38, 13);
-    auto T = [&](int x, int z) { return tileCenter(x, z); };
-    auto hs = [&](int x, int z, int lx, int lz, uint8_t zone) {
-        Vector3 p = T(x, z); p.y = tiles[z * w + x].height;
-        return HoldSpot{p, yawTo(T(x, z), T(lx, lz)), zone};
-    };
-    holdA = {hs(12, 12, 12, 19, ZONE_SITE_A), hs(6, 9, 5, 22, ZONE_SITE_A), hs(16, 8, 5, 24, ZONE_SITE_A), hs(11, 15, 12, 21, ZONE_SITE_A)};
-    holdB = {hs(36, 12, 35, 19, ZONE_SITE_B), hs(41, 9, 42, 21, ZONE_SITE_B), hs(44, 7, 42, 22, ZONE_SITE_B), hs(39, 14, 43, 20, ZONE_SITE_B)};
-    holdMid = {hs(21, 12, 23, 26, 0), hs(25, 15, 24, 30, 0)};
-    routeA = {T(5, 24), T(12, 20), T(24, 19)};
-    routeB = {T(43, 23), T(35, 20), T(24, 19)};
-}
+    // 3. main plateaus: high ground ringed by cliffs, one ramp
+    for (int t = 0; t < 2; t++) {
+        Main& m = mains[t];
+        float ph = r.range(0, 6.28f);
+        auto radiusAt = [&](float a) { return 20.0f + 1.8f * sinf(3 * a + ph) + 1.0f * sinf(5 * a + ph * 2); };
+        Vector2 rampOuter = m.center + m.rampDir * (radiusAt(angleOf(m.rampDir)) + 7);
+        forCells(m.center, 28, [&](int i, float d) {
+            Vector2 q = cellCenter(i);
+            float R = radiusAt(angleOf(q - m.center));
+            Vector2 rel = q - m.center;
+            float along = dot2(rel, m.rampDir), lateral = fabsf(rel.x * m.rampDir.y - rel.y * m.rampDir.x);
+            bool inRamp = along > 0 && lateral < 3.6f && d > R - 3 && d < R + 7;
+            if (d < R - 0.01f && !inRamp) { type[i] = CELL_HIGH; blocked[i] = 0; level[i] = 1; ground[i] = HIGH; protect[i] = 1; }
+            else if (inRamp) {
+                float k = clampf((R + 7 - d) / 10.0f, 0, 1);
+                k = k * k * (3 - 2 * k);
+                type[i] = CELL_RAMP; blocked[i] = 0; level[i] = 0; ground[i] = HIGH * k; protect[i] = 1;
+            } else if (d < R + 3.4f) {
+                type[i] = CELL_ROCK; blocked[i] = 1; level[i] = 0;
+                height[i] = HIGH + 0.25f + 0.35f * fabsf(sinf(q.x * 1.3f + q.y * 0.7f));
+                protect[i] = 2;
+            }
+        });
+        clearAround(rampOuter + m.rampDir * 1.5f, 6);
+        ramp[t] = rampOuter + m.rampDir * 2.0f;
+        rampTop[t] = m.center + m.rampDir * (radiusAt(angleOf(m.rampDir)) - 3);
+        base[t] = m.hub;
+        // tiles around the core
+        forCells(m.hub, 9, [&](int i, float) { if (type[i] == CELL_HIGH) type[i] = (uint8_t)(t == 0 ? CELL_BASE0 : CELL_BASE1); });
+    }
 
-void Map::loadAimArena() {
-    name = "ARENA";
-    w = 24; h = 24;
-    tiles.assign(w * h, Tile{});
-    for (int z = 0; z < h; z++)
-        for (int x = 0; x < w; x++)
-            if (x == 0 || z == 0 || x == w - 1 || z == h - 1) tiles[z * w + x] = tileFromChar('#');
-    spawnAtk = {tileCenter(12, 20)};
-    spawnDef = {tileCenter(12, 3)};
-    siteA = tileCenter(12, 4); siteB = siteA;
-    holdA.clear(); holdB.clear(); holdMid.clear();
-}
-
-// ---------------------------------------------------------------------------
-float Map::groundHeightAt(Vector3 pos, float r, float maxTop) const {
-    int x0, z0, x1, z1;
-    worldToTile({pos.x - r, 0, pos.z - r}, x0, z0);
-    worldToTile({pos.x + r, 0, pos.z + r}, x1, z1);
-    float g = 0;
-    for (int z = z0; z <= z1; z++)
-        for (int x = x0; x <= x1; x++) {
-            float hh = at(x, z).height;
-            if (hh <= maxTop && hh > g) g = hh;
+    // 4. expansions: crystals in an arc behind the hub, two flux vents on the sides
+    auto makeExp = [&](Vector2 hub, Vector2 dir, bool rich, int mainOf) {
+        Expansion e;
+        e.hub = snapBuilding(hub, 5); e.dir = dir; e.rich = rich; e.mainOf = mainOf;
+        float a0 = angleOf(dir);
+        for (int k = 0; k < 8; k++) {
+            float a = a0 + (-60.f + k * 17.f) * 3.14159f / 180.f;
+            float rad = (k % 2) ? 9.4f : 8.4f;
+            Vector2 p = e.hub + V2(cosf(a), sinf(a)) * rad;
+            int ci = cellIndex(p);
+            if (ci < 0) continue;
+            p = cellCenter(ci);
+            bool dup = false;
+            for (auto& q : e.crystals) if (dist2(q, p) < 1.0f) dup = true;
+            if (!dup) e.crystals.push_back(p);
         }
-    return g;
+        for (int s = -1; s <= 1; s += 2) {
+            float a = a0 + s * 102.f * 3.14159f / 180.f;
+            e.geysers.push_back(snapBuilding(e.hub + V2(cosf(a), sinf(a)) * 10.5f, 3));
+        }
+        expansions.push_back(e);
+    };
+    for (int t = 0; t < 2; t++) makeExp(mains[t].hub, mains[t].dir, false, t);
+    for (auto& b : bases) makeExp(b.hub, dirOf(b.dirDeg), b.rich, -1);
+    for (auto& e : expansions) {
+        for (auto& c : e.crystals) { int ci = cellIndex(c); if (ci >= 0) { open(ci); blocked[ci] = 3; } }
+        for (auto& g : e.geysers) forCells(g, 3.2f, [&](int i, float) { open(i); });
+    }
+
+    // 5. decoration: worn paths and grass
+    for (auto& pr : D.paths)
+        for (int m = 0; m < 2; m++) {
+            Vector2 a = m ? mirror(pr.first) : pr.first, b = m ? mirror(pr.second) : pr.second;
+            for (int i = 0; i < C; i++)
+                if (type[i] == CELL_GROUND && distPointSeg(cellCenter(i), a, b) < 2.6f + 0.8f * sinf(cellCenter(i).x * 0.3f)) type[i] = CELL_PATH;
+        }
+    for (int i = 0; i < C; i++) {
+        if (type[i] != CELL_GROUND) continue;
+        Vector2 q = cellCenter(i);
+        float n = sinf(q.x * 0.11f + D.seed) * cosf(q.y * 0.09f) + 0.5f * sinf(q.x * 0.31f - q.y * 0.27f);
+        if (n > 0.55f) type[i] = CELL_GRASS;
+    }
+    for (auto& c : camps) forCells(c, 6, [&](int i, float) { if (type[i] == CELL_GROUND || type[i] == CELL_PATH) type[i] = CELL_GRASS; });
+
+    // 6. map border
+    for (int i = 0; i < C; i++) {
+        int x = i % N, z = i / N;
+        if (x < 2 || z < 2 || x >= N - 2 || z >= N - 2) { type[i] = CELL_ROCK; blocked[i] = 1; level[i] = 0; ground[i] = 0; }
+    }
+    // 7. connectivity: every important point must be reachable from the first ramp
+    auto flood = [&]() {
+        std::vector<uint8_t> seen(C, 0);
+        std::vector<int> st;
+        int s0 = cellIndex(ramp[0]);
+        if (s0 < 0) return seen;
+        st.push_back(s0); seen[s0] = 1;
+        while (!st.empty()) {
+            int c = st.back(); st.pop_back();
+            int cx = c % N, cz = c / N;
+            const int dx[4] = {1, -1, 0, 0}, dz[4] = {0, 0, 1, -1};
+            for (int k = 0; k < 4; k++) {
+                int nx = cx + dx[k], nz = cz + dz[k];
+                if (!inside(nx, nz)) continue;
+                int ni = nz * N + nx;
+                if (seen[ni] || blocked[ni] == 1) continue;
+                seen[ni] = 1; st.push_back(ni);
+            }
+        }
+        return seen;
+    };
+    std::vector<Vector2> must = {ramp[1], titanPos, base[0], base[1]};
+    for (auto& e : expansions) must.push_back(e.hub + e.dir * -7.0f);
+    for (auto& c : camps) must.push_back(c);
+    for (auto& b : beacons) must.push_back(b);
+    for (int pass = 0; pass < 12; pass++) {
+        auto seen = flood();
+        bool all = true;
+        for (auto& p : must) {
+            int ci = cellIndex(p);
+            if (ci < 0 || seen[ci]) continue;
+            all = false;
+            Vector2 d = norm2(titanPos - p);
+            for (float s = 0; s < 140; s += 1.0f) {
+                Vector2 q = p + d * s;
+                int qi = cellIndex(q);
+                if (qi >= 0 && seen[qi]) break;
+                forCells(q, 3.2f, [&](int i, float) { if (protect[i] != 2 && blocked[i] == 1) { type[i] = CELL_GROUND; blocked[i] = 0; ground[i] = level[i] ? HIGH : 0; } });
+            }
+        }
+        if (all) break;
+    }
+    // rock heights with gentle variation (cliffs keep theirs)
+    for (int i = 0; i < C; i++) {
+        if (type[i] != CELL_ROCK || height[i] > 0) continue;
+        int x = i % N, z = i / N;
+        float n = 0.5f + 0.5f * sinf(x * 0.37f + z * 0.13f) * cosf(z * 0.29f - x * 0.11f);
+        height[i] = 2.8f + n * 2.6f + r.f01() * 0.4f;
+    }
+    // smooth surface for the renderer
+    vheight.assign((N + 1) * (N + 1), 0);
+    for (int vz = 0; vz <= N; vz++)
+        for (int vx = 0; vx <= N; vx++) {
+            float sum = 0; int cnt = 0;
+            for (int dz = -1; dz <= 0; dz++)
+                for (int dx = -1; dx <= 0; dx++) {
+                    int x = vx + dx, z = vz + dz;
+                    if (!inside(x, z)) continue;
+                    int i = z * N + x;
+                    if (type[i] == CELL_ROCK || type[i] == CELL_WATER) continue;
+                    sum += ground[i]; cnt++;
+                }
+            vheight[vz * (N + 1) + vx] = cnt ? sum / cnt : 0;
+        }
+    baseRadius = 20;
+    version++;
+    flows.clear();
 }
 
-bool Map::boxBlocked(Vector3 feet, float r, float height) const {
-    (void)height;
-    int x0, z0, x1, z1;
-    const float e = 1e-4f;
-    worldToTile({feet.x - r + e, 0, feet.z - r + e}, x0, z0);
-    worldToTile({feet.x + r - e, 0, feet.z + r - e}, x1, z1);
+float Map::groundHeight(Vector2 p) const {
+    if (vheight.empty()) return 0;
+    float gx = clampf(p.x / CELL, 0, (float)N - 0.001f), gz = clampf(p.y / CELL, 0, (float)N - 0.001f);
+    int x = (int)gx, z = (int)gz;
+    float fx = gx - x, fz = gz - z;
+    const int W = N + 1;
+    float a = vheight[z * W + x], b = vheight[z * W + x + 1], c = vheight[(z + 1) * W + x], d = vheight[(z + 1) * W + x + 1];
+    return lerpf(lerpf(a, b, fx), lerpf(c, d, fx), fz);
+}
+
+int Map::teamOfBase(Vector2 p) const {
+    for (int t = 0; t < 2; t++) if (dist2(p, base[t]) < baseRadius && levelAt(p) == 1) return t;
+    return -1;
+}
+
+Vector2 Map::snapBuilding(Vector2 p, int fp) const {
+    // align footprint to the cell grid
+    float half = fp * CELL * 0.5f;
+    float ox = (fp % 2) ? CELL * 0.5f : 0;
+    float x = roundf((p.x - ox) / CELL) * CELL + ox;
+    float z = roundf((p.y - ox) / CELL) * CELL + ox;
+    (void)half;
+    return {x, z};
+}
+
+bool Map::canPlace(Vector2 c, int fp) const {
+    float half = fp * CELL * 0.5f;
+    int x0 = (int)floorf((c.x - half) / CELL + 0.01f), z0 = (int)floorf((c.y - half) / CELL + 0.01f);
+    for (int z = z0; z < z0 + fp; z++)
+        for (int x = x0; x < x0 + fp; x++) {
+            if (!inside(x, z) || blocked[z * N + x] || type[z * N + x] == CELL_RAMP) return false;
+            if (x < 3 || z < 3 || x >= N - 3 || z >= N - 3) return false;
+        }
+    return true;
+}
+
+bool Map::nearResources(Vector2 c, int fp, float margin) const {
+    float half = fp * CELL * 0.5f + margin;
+    int x0 = (int)floorf((c.x - half) / CELL), z0 = (int)floorf((c.y - half) / CELL);
+    int x1 = (int)floorf((c.x + half) / CELL), z1 = (int)floorf((c.y + half) / CELL);
     for (int z = z0; z <= z1; z++)
         for (int x = x0; x <= x1; x++)
-            if (at(x, z).height > feet.y + 1e-3f) return true;
+            if (inside(x, z) && blocked[z * N + x] == 3) return true;
     return false;
 }
 
-bool Map::tileWalkable(int x, int z) const { return inBounds(x, z) && at(x, z).walkableNav; }
-
-// DDA over tiles collecting solid spans
-void Map::raySpans(Vector3 o, Vector3 d, float maxDist, std::vector<SolidSpan>& out) const {
-    out.clear();
-    float gx = o.x / TILE + w * 0.5f, gz = o.z / TILE + h * 0.5f;
-    int tx = (int)floorf(gx), tz = (int)floorf(gz);
-    float ddx = d.x / TILE, ddz = d.z / TILE;   // tile units per world distance
-    int stepX = ddx > 0 ? 1 : -1, stepZ = ddz > 0 ? 1 : -1;
-    float tDeltaX = fabsf(ddx) > 1e-9f ? fabsf(1.0f / ddx) : 1e30f;
-    float tDeltaZ = fabsf(ddz) > 1e-9f ? fabsf(1.0f / ddz) : 1e30f;
-    float tMaxX = fabsf(ddx) > 1e-9f ? ((stepX > 0 ? (tx + 1 - gx) : (gx - tx)) * tDeltaX) : 1e30f;
-    float tMaxZ = fabsf(ddz) > 1e-9f ? ((stepZ > 0 ? (tz + 1 - gz) : (gz - tz)) * tDeltaZ) : 1e30f;
-    float t0 = 0;
-    Vector3 entryNormal = {0, 0, 0};
-    float floorT = d.y < -1e-6f ? -o.y / d.y : 1e30f;
-    float limit = std::min(maxDist, floorT);
-    int guard = 0;
-    while (t0 < limit && guard++ < 512) {
-        float t1;
-        Vector3 nextNormal;
-        int ntx = tx, ntz = tz;
-        if (tMaxX < tMaxZ) { t1 = tMaxX; tMaxX += tDeltaX; ntx += stepX; nextNormal = {(float)-stepX, 0, 0}; }
-        else { t1 = tMaxZ; tMaxZ += tDeltaZ; ntz += stepZ; nextNormal = {0, 0, (float)-stepZ}; }
-        t1 = std::min(t1, limit);
-        const Tile& tl = at(tx, tz);
-        if (tl.height > 0) {
-            float a = t0, b = t1;
-            Vector3 n = entryNormal;
-            float hh = tl.height;
-            if (fabsf(d.y) < 1e-7f) { if (o.y > hh) a = b + 1; }
-            else {
-                float th = (hh - o.y) / d.y;
-                if (d.y > 0) b = std::min(b, th);
-                else { if (th > a) { a = th; n = {0, 1, 0}; } }
-            }
-            if (a < b) {
-                if (a == 0 && t0 == 0) n = d * -1.0f;
-                if (!out.empty() && fabsf(out.back().tOut - a) < 1e-4f && out.back().mat == tl.mat) out.back().tOut = b;
-                else out.push_back({a, b, tl.mat, n});
-            }
-        }
-        if (!inBounds(tx, tz) && t1 > 4.0f) break;
-        tx = ntx; tz = ntz; t0 = t1; entryNormal = nextNormal;
-        if (t1 >= limit) break;
-    }
-    if (floorT <= maxDist) out.push_back({floorT, 1e30f, MAT_FLOOR, {0, 1, 0}});
+void Map::setBlocked(Vector2 c, int fp, uint8_t v) {
+    float half = fp * CELL * 0.5f;
+    int x0 = (int)floorf((c.x - half) / CELL + 0.01f), z0 = (int)floorf((c.y - half) / CELL + 0.01f);
+    for (int z = z0; z < z0 + fp; z++)
+        for (int x = x0; x < x0 + fp; x++)
+            if (inside(x, z) && blocked[z * N + x] != 1 && !(v == 0 && type[z * N + x] == CELL_WATER)) blocked[z * N + x] = v;
+    version++;
 }
 
-RayHit Map::raycast(Vector3 o, Vector3 d, float maxDist) const {
-    static thread_local std::vector<SolidSpan> spans;
-    raySpans(o, d, maxDist, spans);
-    RayHit r;
-    if (!spans.empty()) {
-        r.hit = true; r.t = spans[0].tIn; r.pos = o + d * r.t; r.normal = spans[0].nIn; r.mat = spans[0].mat;
-        worldToTile(r.pos - r.normal * 0.01f, r.tx, r.tz);
-    }
-    return r;
-}
-
-bool Map::lineOfSight(Vector3 a, Vector3 b) const {
-    Vector3 d = b - a;
-    float L = len3(d);
-    if (L < 1e-4f) return true;
-    RayHit h = raycast(a, d * (1.0f / L), L);
-    return !h.hit || h.t >= L - 0.05f;
-}
-
-// ---------------------------------------------------------------------------
-bool Map::findPath(Vector3 from, Vector3 to, std::vector<Vector3>& out) const {
-    out.clear();
-    int sx, sz, gx, gz;
-    worldToTile(from, sx, sz);
-    worldToTile(to, gx, gz);
-    auto nearestWalk = [&](int& x, int& z) {
-        if (tileWalkable(x, z)) return true;
-        for (int r = 1; r < 4; r++)
-            for (int dz = -r; dz <= r; dz++)
-                for (int dx = -r; dx <= r; dx++)
-                    if (tileWalkable(x + dx, z + dz)) { x += dx; z += dz; return true; }
-        return false;
-    };
-    if (!nearestWalk(sx, sz) || !nearestWalk(gx, gz)) return false;
-    int N = w * h;
-    std::vector<float> g(N, 1e30f);
-    std::vector<int> parent(N, -1);
-    std::vector<uint8_t> closed(N, 0);
-    using QE = std::pair<float, int>;
-    std::priority_queue<QE, std::vector<QE>, std::greater<QE>> open;
-    auto H = [&](int x, int z) { float dx = fabsf((float)(x - gx)), dz = fabsf((float)(z - gz)); return (dx + dz) + (1.4142f - 2) * std::min(dx, dz); };
-    int s = sz * w + sx, goal = gz * w + gx;
-    g[s] = 0; open.push({H(sx, sz), s});
-    while (!open.empty()) {
-        int cur = open.top().second; open.pop();
-        if (closed[cur]) continue;
-        closed[cur] = 1;
-        if (cur == goal) break;
-        int cx = cur % w, cz = cur / w;
-        for (int dz = -1; dz <= 1; dz++)
-            for (int dx = -1; dx <= 1; dx++) {
-                if (!dx && !dz) continue;
-                int nx = cx + dx, nz = cz + dz;
-                if (!tileWalkable(nx, nz)) continue;
-                if (dx && dz && (!tileWalkable(cx + dx, cz) || !tileWalkable(cx, cz + dz))) continue;
-                if (fabsf(at(nx, nz).height - at(cx, cz).height) > STEP_HEIGHT + 0.01f) continue;
-                int ni = nz * w + nx;
-                // penalize hugging walls a bit so bots keep off corners
-                float wallPen = 0;
-                for (int k = 0; k < 4; k++) {
-                    static const int ox[4] = {1, -1, 0, 0}, oz[4] = {0, 0, 1, -1};
-                    if (!tileWalkable(nx + ox[k], nz + oz[k])) wallPen += 0.15f;
-                }
-                float ng = g[cur] + ((dx && dz) ? 1.4142f : 1.0f) + wallPen;
-                if (ng < g[ni]) { g[ni] = ng; parent[ni] = cur; open.push({ng + H(nx, nz), ni}); }
-            }
-    }
-    if (parent[goal] < 0 && goal != s) return false;
-    std::vector<Vector3> raw;
-    for (int c = goal; c >= 0; c = parent[c]) {
-        Vector3 p = tileCenter(c % w, c / w);
-        p.y = at(c % w, c / w).height;
-        raw.push_back(p);
-        if (c == s) break;
-    }
-    std::reverse(raw.begin(), raw.end());
-    if (!raw.empty()) { Vector3 t = to; t.y = raw.back().y; raw.back() = t; }
-    // string pulling: skip waypoints when the straight segment is clear
-    auto clear = [&](Vector3 a, Vector3 b) {
-        Vector3 d = b - a; d.y = 0;
-        float L = len2xz(d);
-        if (L < 0.01f) return true;
-        Vector3 dir = d * (1.0f / L);
-        Vector3 side = {-dir.z, 0, dir.x};
-        float baseH = -1;
-        for (float t = 0; t <= L; t += 0.3f) {
-            for (float o : {-0.55f, 0.0f, 0.55f}) {
-                Vector3 p = a + dir * t + side * o;
-                int x, z; worldToTile(p, x, z);
-                if (!tileWalkable(x, z)) return false;
-                float hh = at(x, z).height;
-                if (baseH < 0) baseH = hh; else if (fabsf(hh - baseH) > 0.01f) return false;
-            }
-        }
-        return true;
-    };
-    size_t i = 0;
-    out.push_back(raw[0]);
-    while (i < raw.size() - 1) {
-        size_t j = raw.size() - 1;
-        while (j > i + 1 && !clear(raw[i], raw[j])) j--;
-        out.push_back(raw[j]);
-        i = j;
+bool Map::lineClear(Vector2 a, Vector2 b) const {
+    Vector2 d = b - a;
+    float L = len2(d);
+    int steps = (int)(L / (CELL * 0.45f)) + 1;
+    for (int i = 0; i <= steps; i++) {
+        Vector2 p = a + d * ((float)i / steps);
+        if (!walkable(p)) return false;
     }
     return true;
 }
 
-Vector3 Map::randomWalkableNear(Vector3 p, float radius, Rng& rng) const {
-    for (int k = 0; k < 30; k++) {
-        Vector3 q = p + V3(rng.range(-radius, radius), 0, rng.range(-radius, radius));
-        int x, z; worldToTile(q, x, z);
-        if (tileWalkable(x, z) && at(x, z).height == 0) return tileCenter(x, z);
-    }
+Vector2 Map::nearestWalkable(Vector2 p) const {
+    if (walkable(p)) return p;
+    int ci = cellIndex(p);
+    int cx = ci >= 0 ? ci % N : (int)(p.x / CELL), cz = ci >= 0 ? ci / N : (int)(p.y / CELL);
+    for (int r = 1; r < 20; r++)
+        for (int dz = -r; dz <= r; dz++)
+            for (int dx = -r; dx <= r; dx++) {
+                if (std::max(abs(dx), abs(dz)) != r) continue;
+                if (walkableCell(cx + dx, cz + dz)) return cellCenter((cz + dz) * N + cx + dx);
+            }
     return p;
 }
 
-// ---------------------------------------------------------------------------
-// Mesh building : vertex color alpha encodes the procedural pattern id
-//   250 concrete wall panels, 200 wood planks, 150 floor tiles, 100 metal, 60 site floor
-// ---------------------------------------------------------------------------
-struct MeshBuilder {
-    std::vector<float> v, n;
-    std::vector<unsigned char> c;
-    void quad(Vector3 a, Vector3 b, Vector3 cc, Vector3 d, Vector3 nn, Color col) {
-        Vector3 p[6] = {a, b, cc, a, cc, d};
-        for (auto& q : p) {
-            v.insert(v.end(), {q.x, q.y, q.z});
-            n.insert(n.end(), {nn.x, nn.y, nn.z});
-            c.insert(c.end(), {col.r, col.g, col.b, col.a});
+FlowField& Map::getFlow(int goal, float radius) {
+    long long key = (long long)goal * 64 + (int)std::min(radius, 60.f);
+    FlowField& f = flows[key];
+    f.lastUse = frame;
+    if (f.version == version && f.goal == goal) return f;
+    f.goal = goal; f.version = version;
+    f.dist.assign(N * N, 1e9f);
+    using QE = std::pair<float, int>;
+    std::priority_queue<QE, std::vector<QE>, std::greater<QE>> q;
+    // seed: walkable cells within radius of the goal (handles blocked goals such as buildings)
+    Vector2 gp = cellCenter(goal);
+    int r = (int)ceilf(radius / CELL) + 1;
+    int gx = goal % N, gz = goal / N;
+    bool seeded = false;
+    for (int dz = -r; dz <= r; dz++)
+        for (int dx = -r; dx <= r; dx++) {
+            int x = gx + dx, z = gz + dz;
+            if (!walkableCell(x, z)) continue;
+            if (dist2(cellCenter(z * N + x), gp) > radius + CELL * 0.75f) continue;
+            f.dist[z * N + x] = 0; q.push({0, z * N + x}); seeded = true;
         }
+    if (!seeded) {
+        Vector2 w = nearestWalkable(gp);
+        int wi = cellIndex(w);
+        if (wi >= 0) { f.dist[wi] = 0; q.push({0, wi}); }
     }
-    void box(Vector3 mn, Vector3 mx, Color top, Color side) {
-        // top (+y)
-        quad({mn.x, mx.y, mn.z}, {mn.x, mx.y, mx.z}, {mx.x, mx.y, mx.z}, {mx.x, mx.y, mn.z}, {0, 1, 0}, top);
-        // -z
-        quad({mn.x, mn.y, mn.z}, {mn.x, mx.y, mn.z}, {mx.x, mx.y, mn.z}, {mx.x, mn.y, mn.z}, {0, 0, -1}, side);
-        // +z
-        quad({mx.x, mn.y, mx.z}, {mx.x, mx.y, mx.z}, {mn.x, mx.y, mx.z}, {mn.x, mn.y, mx.z}, {0, 0, 1}, side);
-        // -x
-        quad({mn.x, mn.y, mx.z}, {mn.x, mx.y, mx.z}, {mn.x, mx.y, mn.z}, {mn.x, mn.y, mn.z}, {-1, 0, 0}, side);
-        // +x
-        quad({mx.x, mn.y, mn.z}, {mx.x, mx.y, mn.z}, {mx.x, mx.y, mx.z}, {mx.x, mn.y, mx.z}, {1, 0, 0}, side);
+    while (!q.empty()) {
+        auto [d, c] = q.top(); q.pop();
+        if (d > f.dist[c]) continue;
+        int cx = c % N, cz = c / N;
+        for (int dz = -1; dz <= 1; dz++)
+            for (int dx = -1; dx <= 1; dx++) {
+                if (!dx && !dz) continue;
+                int nx = cx + dx, nz = cz + dz;
+                if (!walkableCell(nx, nz)) continue;
+                if (dx && dz && (!walkableCell(cx + dx, cz) || !walkableCell(cx, cz + dz))) continue;
+                float nd = d + ((dx && dz) ? 1.4142f : 1.0f);
+                int ni = nz * N + nx;
+                if (nd < f.dist[ni]) { f.dist[ni] = nd; q.push({nd, ni}); }
+            }
     }
-};
+    // keep the cache small
+    if (flows.size() > 48) {
+        uint32_t oldest = UINT32_MAX; long long ok = -1;
+        for (auto& kv : flows) if (kv.second.lastUse < oldest && kv.first != key) { oldest = kv.second.lastUse; ok = kv.first; }
+        if (ok >= 0) flows.erase(ok);
+        return flows[key];
+    }
+    return f;
+}
 
-Mesh Map::buildMesh() const {
-    MeshBuilder mb;
-    // floor tiles (merged per row by type)
-    for (int z = 0; z < h; z++) {
-        int x = 0;
-        while (x < w) {
-            const Tile& t = at(x, z);
-            uint8_t key = (t.zone & (ZONE_SITE_A | ZONE_SITE_B)) ? (t.zone & (ZONE_SITE_A | ZONE_SITE_B)) : 0;
-            int x2 = x;
-            while (x2 + 1 < w) {
-                const Tile& t2 = at(x2 + 1, z);
-                uint8_t k2 = (t2.zone & (ZONE_SITE_A | ZONE_SITE_B)) ? (t2.zone & (ZONE_SITE_A | ZONE_SITE_B)) : 0;
-                if (k2 != key) break;
-                x2++;
-            }
-            Color col = key == ZONE_SITE_A ? Color{150, 120, 108, 60} : key == ZONE_SITE_B ? Color{108, 128, 150, 60} : Color{120, 122, 128, 150};
-            float x0 = tileMinX(x), x1 = tileMinX(x2) + TILE, z0 = tileMinZ(z), z1 = z0 + TILE;
-            mb.quad({x0, 0, z0}, {x0, 0, z1}, {x1, 0, z1}, {x1, 0, z0}, {0, 1, 0}, col);
-            x = x2 + 1;
-        }
+Vector2 Map::flowDirection(Vector2 from, Vector2 goal, float goalRadius) {
+    if (lineClear(from, goal)) return norm2(goal - from);
+    int gi = cellIndex(goal);
+    if (gi < 0) return norm2(goal - from);
+    FlowField& f = getFlow(gi, goalRadius);
+    int ci = cellIndex(from);
+    if (ci < 0) return norm2(goal - from);
+    if (blocked[ci]) {
+        Vector2 w = nearestWalkable(from);
+        return norm2(w - from);
     }
-    // solids: greedy merge rectangles of identical chars
-    std::vector<uint8_t> used(w * h, 0);
-    for (int z = 0; z < h; z++)
-        for (int x = 0; x < w; x++) {
-            const Tile& t = at(x, z);
-            if (t.height <= 0 || used[z * w + x]) continue;
-            int x2 = x;
-            while (x2 + 1 < w && !used[z * w + x2 + 1] && at(x2 + 1, z).ch == t.ch) x2++;
-            int z2 = z;
-            bool ok = true;
-            while (ok && z2 + 1 < h) {
-                for (int xx = x; xx <= x2; xx++)
-                    if (used[(z2 + 1) * w + xx] || at(xx, z2 + 1).ch != t.ch) { ok = false; break; }
-                if (ok) z2++;
+    int cx = ci % N, cz = ci / N;
+    float best = f.dist[ci];
+    Vector2 dir{0, 0};
+    // weighted gradient over the 8 neighbours for smooth motion
+    for (int dz = -1; dz <= 1; dz++)
+        for (int dx = -1; dx <= 1; dx++) {
+            if (!dx && !dz) continue;
+            int nx = cx + dx, nz = cz + dz;
+            if (!walkableCell(nx, nz)) continue;
+            if (dx && dz && (!walkableCell(cx + dx, cz) || !walkableCell(cx, cz + dz))) continue;
+            float nd = f.dist[nz * N + nx];
+            if (nd < best - 0.01f) {
+                float w = (best - nd) / ((dx && dz) ? 1.4142f : 1.0f);
+                dir += norm2(V2((float)dx, (float)dz)) * (w * w);
             }
-            for (int zz = z; zz <= z2; zz++)
-                for (int xx = x; xx <= x2; xx++) used[zz * w + xx] = 1;
-            Vector3 mn = {tileMinX(x), 0, tileMinZ(z)}, mx = {tileMinX(x2) + TILE, t.height, tileMinZ(z2) + TILE};
-            // regional tint: warm on the A side (x<0), cool on the B side (x>0)
-            float cx = (mn.x + mx.x) * 0.5f / (w * TILE * 0.5f);
-            Color warm = {196, 178, 150, 250}, cool = {150, 170, 182, 250};
-            Color wall = mixColor(warm, cool, clampf(cx * 0.5f + 0.5f, 0, 1));
-            wall.a = 250;
-            Color top = wall, side = wall;
-            switch (t.ch) {
-            case 'x': side = top = Color{150, 112, 72, 200}; break;
-            case 'c': side = Color{176, 128, 70, 200}; top = Color{190, 140, 80, 200}; break;
-            case 'k': side = Color{160, 118, 66, 200}; top = Color{180, 132, 76, 200}; break;
-            case 'C': side = Color{142, 104, 60, 200}; top = Color{165, 122, 70, 200}; break;
-            case 'w': side = Color{132, 136, 140, 250}; top = Color{160, 162, 165, 250}; break;
-            case 'm': side = top = Color{110, 120, 130, 100}; break;
-            case '1': case '2': case '3': case '4': side = Color{140, 140, 146, 250}; top = Color{132, 134, 140, 150}; break;
-            default: top = Color{(unsigned char)(wall.r * 0.8f), (unsigned char)(wall.g * 0.8f), (unsigned char)(wall.b * 0.8f), 250}; break;
-            }
-            mb.box(mn, mx, top, side);
         }
-    Mesh m = {0};
-    m.vertexCount = (int)mb.v.size() / 3;
-    m.triangleCount = m.vertexCount / 3;
-    m.vertices = (float*)MemAlloc(mb.v.size() * sizeof(float));
-    m.normals = (float*)MemAlloc(mb.n.size() * sizeof(float));
-    m.colors = (unsigned char*)MemAlloc(mb.c.size());
-    memcpy(m.vertices, mb.v.data(), mb.v.size() * sizeof(float));
-    memcpy(m.normals, mb.n.data(), mb.n.size() * sizeof(float));
-    memcpy(m.colors, mb.c.data(), mb.c.size());
-    UploadMesh(&m, false);
-    return m;
+    if (len2(dir) < 1e-4f) {
+        // at a local minimum: aim at the lowest neighbour centre
+        return norm2(goal - from);
+    }
+    return norm2(dir);
+}
+
+float Map::flowDistance(Vector2 from, Vector2 goal) {
+    int gi = cellIndex(goal), ci = cellIndex(from);
+    if (gi < 0 || ci < 0) return 1e9f;
+    return getFlow(gi, 1.5f).dist[ci] * CELL;
 }
 
 } // namespace ax

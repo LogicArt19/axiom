@@ -1,27 +1,16 @@
-// game.h : application, screens and the main loop
+// game.h : application, screens, RTS input and the main loop
 #pragma once
-#include "world.h"
-#include "bot.h"
+#include "sim.h"
+#include "ai.h"
 #include "hud.h"
 #include "net.h"
+#include "render.h"
 
 namespace ax {
 
-enum Screen { SCR_MAIN, SCR_PLAY, SCR_SETTINGS, SCR_STATS, SCR_GAME, SCR_MATCHEND, SCR_CONNECT };
+enum Screen { SCR_MAIN, SCR_PLAY, SCR_MULTI, SCR_SETTINGS, SCR_STATS, SCR_GAME, SCR_END, SCR_CONNECT, SCR_LOBBY };
 enum NetRole { ROLE_OFFLINE, ROLE_HOST, ROLE_CLIENT };
-
-struct AimTarget { Vector3 pos, vel; float r; float spawn; bool alive; };
-
-struct AimTrainer {
-    int kind = 0;                 // 0 grid, 1 flick, 2 tracking
-    bool running = false, finished = false;
-    float start = 0, duration = 60;
-    int hits = 0, shots = 0, score = 0;
-    std::vector<float> reactions;
-    std::vector<AimTarget> targets;
-    Rng rng{55};
-    Vector3 origin{}, fwd{0, 0, -1}, right{1, 0, 0};
-};
+enum InputMode { M_NONE, M_ATTACK_MOVE, M_ABILITY, M_PLACE };
 
 class App {
 public:
@@ -29,83 +18,86 @@ public:
 
 private:
     World world;
-    BotSystem bots;
+    AISystem ai;
     HudState hud;
     NetServer server;
     NetClient client;
     NetRole role = ROLE_OFFLINE;
+    int player = 0;
 
     World menuWorld;
-    BotSystem menuBots;
+    AISystem menuAI;
     float menuAcc = 0, menuCam = 0;
-    bool menuReady = false;
+    Vector2 menuFocus{100, 100};
 
     Screen screen = SCR_MAIN;
-    Screen settingsReturn = SCR_MAIN;
-    bool inGameSettings = false;
     int settingsTab = 0;
     float settingsScroll = 0;
-    int playMode = 0;
-    int aimKind = 0;
-
-    int localId = -1;
-    float acc = 0;
-    float viewYaw = 0, viewPitch = 0;
-    uint32_t pendingButtons = 0;
-    uint8_t pendingSelect = 0;
-    bool crouchToggled = false, walkToggled = false;
-    bool paused = false, buyOpen = false, consoleOpen = false;
-    int spectateId = -1;
-    float deathTime = -10;
-    int killerId = -1;
-    bool cursorLocked = false;
+    bool inGameSettings = false, paused = false, consoleOpen = false, showHelp = false;
     bool quit = false;
+    float acc = 0, gameClock = 0, endTimer = -1;
     bool statsCommitted = false;
     int ratingDelta = 0;
-    float fireSoundTimer = 0;
-    char joinAddr[64] = "127.0.0.1";
     std::string connectError;
-    std::vector<Vector3> nadePath;
-    AimTrainer aim;
-    float gameTime = 0;
-    bool autopilot = false;
-    bool forceScoreboard = false;
-    void autotest(const char* test, int frame);
+    char joinAddr[64] = "127.0.0.1";
 
+    // camera
+    Vector2 camTarget{40, 160};
+    float camZoom = 1.0f;
+    bool camLock = false;
+    Camera3D cam{};
+
+    // selection & input
+    std::vector<uint16_t> selection;
+    std::vector<uint16_t> groups[10];
+    float groupTap[10] = {0};
+    InputMode mode = M_NONE;
+    int modeArg = 0;
+    bool dragging = false;
+    Vector2 dragStart{};
+    double lastClick = 0;
+    uint16_t lastClickId = 0;
+    std::vector<double> actionTimes;
+    int idleCycle = 0;
     std::vector<std::string> conLog;
-    char conInput[160] = "";
+    char conInput[128] = "";
 
     void initWindow();
     void applyVideo(bool initial);
-    void setCursor(bool locked);
-    void startOffline(GameMode m);
-    void startHost(GameMode m);
+    void startOffline();
+    void startHost();
     void startJoin();
     void leaveMatch();
-    void setupMatchPlayers(GameMode m);
-
     void frame(float dt);
+
     void updateGame(float dt);
-    void localInput(float dt);
-    void buildCmd(UserCmd& c);
-    void processEvents(std::vector<GameEvent>& evs, const World& w);
+    void handleInput(float dt);
+    void issue(Command c);
+    Vector2 mouseGround() const;
+    uint16_t pickEntity(Vector2 screen) const;
+    std::vector<CardButton> buildCard(std::vector<std::function<void()>>& actions);
+    void selectOwnedOnly();
+    void processEvents(const std::vector<GameEvent>& evs);
+    void updateCamera(float dt);
     void drawGame(float dt);
     void drawPause();
     void drawConsole();
-    void execCommand(const std::string& cmd);
-    void commitMatchStats();
-    void updateAim(float dt);
-    void drawAimHud();
+    void execCommand(const std::string& s);
+    void commitStats();
+    void castAbility(int slot, bool atCursor);
 
-    void updateMenuWorld(float dt);
+    void tickMenuWorld(float dt);
     void drawMenuBackground(float dt);
     void drawMainMenu();
     void drawPlayMenu();
-    void drawSettings();
+    void drawMultiMenu();
+    void drawLobby();
+    void drawSettings(Rectangle area);
     void drawStats();
-    void drawMatchEnd();
+    void drawEnd();
     void drawConnect();
-    void drawSettingsPanel(Rectangle area);
+    void drawHelp();
+    void autotest(const char* t, int f);
 };
 
 } // namespace ax

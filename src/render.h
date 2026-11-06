@@ -1,78 +1,63 @@
-// render.h : 3D world renderer, viewmodel and visual effects
+// render.h : top-down 3D renderer for the battlefield
 #pragma once
-#include "world.h"
+#include "sim.h"
 
 namespace ax {
 
 struct Particle { Vector3 pos, vel; float life, maxLife, size, gravity; Color col; bool additive; };
-struct Decal { Vector3 pos, normal; float time; Material mat; };
-struct Tracer { Vector3 a, b; float time; bool local; };
+struct Beam { Vector3 a, b; float time, dur; Color col; float width; };
+struct GroundMark { Vector2 pos; float radius; float time, dur; Color col; };
 
-struct ViewState {
-    Vector3 eye{};
-    float yaw = 0, pitch = 0;      // includes visual punch
-    float fovY = 73.7f;
-    int localId = -1;              // player whose viewmodel is drawn (-1 none)
-    bool thirdPerson = false;
-    float alpha = 1;               // interpolation factor
-    float frameTime = 0;
+struct RenderView {
+    Camera3D cam{};
+    int team = 0;                 // perspective for fog of war (-1 = everything)
+    int player = 0;
+    float alpha = 1;              // interpolation between ticks
+    const std::vector<uint16_t>* selection = nullptr;
+    uint16_t hovered = 0;
+    // placement / targeting previews
+    int placeType = 0; Vector2 placePos{}; bool placeOk = false;
+    bool aiming = false; Vector2 aimFrom{}, aimAt{}; float aimRange = 0, aimRadius = 0; int aimMode = 0;
 };
 
 class Renderer {
 public:
     void init();
     void shutdown();
-    void onMapLoaded(const Map& m);
-    void render(const World& w, const ViewState& v);        // 3D pass (world + viewmodel)
-    void handleEvent(const World& w, const GameEvent& e, int localId);
-    void update(float dt, const World& w);
-    void addViewKick(float k) { vmKick += k; }
-    void notifyMouse(float dx, float dy) { swayX += dx; swayY += dy; }
-    void clearEffects() { particles.clear(); decals.clear(); tracers.clear(); }
-    Camera3D lastCamera{};
-    std::function<void()> extra3D;          // custom 3D drawing hook (aim trainer, grenade preview)
-    void drawSphere(Vector3 c, float r, Color col, float emissive = 0);
-
-    // shared draw helpers (also used by menus)
-    void drawBox(const Matrix& m, Color c, float emissive = 0);
-    void drawWeaponModel(WeaponId w, const Matrix& base, Color tint, float t, bool viewmodel);
+    void onMapLoaded(const World& w);
+    void render(const World& w, const RenderView& v);
+    void handleEvent(const World& w, const GameEvent& e);
+    void update(float dt);
+    void clearEffects() { particles.clear(); beams.clear(); marks.clear(); }
+    void clickMarker(Vector2 p, bool attack) { marks.push_back({p, 0.9f, clock, 0.45f, attack ? Color{255, 80, 70, 255} : Color{90, 230, 120, 255}}); }
+    float clock = 0;
 
 private:
     Shader shader{};
-    int locViewPos = -1, locSun = -1, locFogColor = -1, locFogDensity = -1, locBrightness = -1, locFlash = -1,
-        locEmissive = -1, locHeight = -1, locMapInfo = -1, locShadows = -1;
-    Model mapModel{};
-    bool mapLoaded = false;
-    Mesh cube{}, sphere{};
+    int locViewPos = -1, locSun = -1, locFogColor = -1, locFogDensity = -1, locBrightness = -1, locEmissive = -1, locMapInfo = -1,
+        locShadows = -1, locTime = -1, locUseFog = -1;
+    Mesh cube{}, sphere{}, terrain{};
+    bool terrainLoaded = false;
     ::Material mat{};
-    Texture2D heightTex{};
-    Vector3 sunDir = {-0.42f, -0.78f, -0.46f};
-    float mapW = 0, mapH = 0;
-
-    std::vector<Particle> particles;
-    std::vector<Decal> decals;
-    std::vector<Tracer> tracers;
-    float muzzleFlashTime = -10;
-    Vector3 muzzleFlashPos{};
-    float worldTime = 0;
-    float renderTime = 0;
+    Texture2D heightTex{}, fogTex{};
+    Image fogImg{};
+    int mapVersion = -1;
     float baseEmissive = 0;
-
-    // viewmodel animation state
-    float vmKick = 0, vmBobPhase = 0, vmBobAmp = 0, swayX = 0, swayY = 0, vmSwayX = 0, vmSwayY = 0;
-    float vmLandDip = 0;
-    float lastShotAnim = -10;
-    float knifeSwingTime = -10;
-    bool knifeHeavy = false;
-    float throwAnimTime = -10;
+    std::vector<Particle> particles;
+    std::vector<Beam> beams;
+    std::vector<GroundMark> marks;
 
     void setEmissive(float e);
-    void drawPlayers(const World& w, const ViewState& v);
-    void drawPlayer(const World& w, const Player& p, const ViewState& v, bool enemy);
-    void drawViewmodel(const World& w, const ViewState& v);
-    void drawEffects(const World& w, const ViewState& v);
-    void drawSmokes(const World& w, const ViewState& v);
-    void spawnBurst(Vector3 pos, Vector3 normal, Color c, int n, float speed, float life, float size, float gravity, bool additive);
+    void box(const Matrix& m, Color c, float em = 0);
+    void ball(Vector3 c, float r, Color col, float em = 0);
+    void ring(Vector2 c, float r, float thick, Color col, float y = 0.05f);
+    void disc(Vector2 c, float r, Color col, float y = 0.04f);
+    void drawEntity(const World& w, const Entity& e, const RenderView& v);
+    void drawUnitModel(const Entity& e, Vector3 pos, float facing, Color team, Color accent, float t, float moveAmt, float attackT, float scale);
+    void drawBuildingModel(const World& w, const Entity& e, Color team, Color accent);
+    void updateHeightTex(const World& w);
+    void updateFogTex(const World& w, int team);
+    void burst(Vector3 p, Color c, int n, float speed, float life, float size, float gravity, bool additive);
 };
 
 extern Renderer g_renderer;

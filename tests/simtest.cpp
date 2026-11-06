@@ -1,37 +1,44 @@
-// Headless bot-vs-bot match to validate the simulation
-#include "../src/world.h"
-#include "../src/bot.h"
-#include "../src/config.h"
+// Headless AI vs AI match: AxiomSimTest [playersPerTeam] [skillA] [skillB] [mapId]
+#include "../src/sim.h"
+#include "../src/ai.h"
 using namespace ax;
 int main(int argc, char** argv) {
-    initWeapons();
-    int skillA = argc > 1 ? atoi(argv[1]) : 2, skillB = argc > 2 ? atoi(argv[2]) : 2;
-    World w; BotSystem bots;
-    w.init(MODE_COMPETITIVE);
-    for (int i = 0; i < 5; i++) { char n[16]; snprintf(n, 16, "A%d", i); w.addPlayer(n, true, 0, skillA); }
-    for (int i = 0; i < 5; i++) { char n[16]; snprintf(n, 16, "B%d", i); w.addPlayer(n, true, 1, skillB); }
-    w.startMatch();
-    UserCmd cmds[MAX_PLAYERS];
-    int kills = 0, plants = 0, defuses = 0, hs = 0, nades = 0, buys = 0, stuckChecks = 0;
-    long ticks = 0;
-    while (w.phase != PH_MATCH_END && ticks < 128L * 60 * 90) {
-        for (int i = 0; i < MAX_PLAYERS; i++) if (w.players[i].active) bots.think(w, i, cmds[i]);
-        w.step(cmds);
-        for (auto& e : w.events) {
-            bots.onEvent(w, e);
-            if (e.type == EV_KILL) { kills++; if (e.flags & 1) hs++; }
-            if (e.type == EV_BOMB_PLANTED) plants++;
-            if (e.type == EV_BOMB_DEFUSED) defuses++;
-            if (e.type == EV_NADE_THROW) nades++;
-            if (e.type == EV_BUY) buys++;
-            if (e.type == EV_ROUND_END) {
-                printf("R%2d %s  score %d-%d  reason=%d  t=%.0fs\n", w.round, e.a == TEAM_ATK ? "ATK" : "DEF", w.squadScore[0], w.squadScore[1], e.value, w.time - w.roundStartTime);
-            }
-        }
-        w.events.clear();
-        ticks++;
+    initData();
+    int ppt = argc > 1 ? atoi(argv[1]) : 1, sa = argc > 2 ? atoi(argv[2]) : 2, sb = argc > 3 ? atoi(argv[3]) : 2;
+    World w; AISystem ai;
+    int mapId = argc > 4 ? atoi(argv[4]) : 0;
+    w.setup(ppt, mapId);
+    printf("map %d %s\n", mapId, mapInfo(mapId).name);
+    const char* heroes = getenv("HEROES");   // e.g. "012345" : hero index per player slot
+    for (int i = 0; i < ppt * 2; i++) {
+        int hi = heroes && (int)strlen(heroes) > i ? heroes[i] - '0' : (i * 5 + 1) % HERO_COUNT;
+        w.addPlayer(i % 2 ? "B" : "A", i % 2, (UnitType)(HERO_FIRST + hi), true, i % 2 ? sb : sa);
     }
-    printf("MATCH END winner squad %d  %d-%d  rounds=%zu  kills=%d hs=%d plants=%d defuses=%d nades=%d buys=%d simtime=%.0fs\n",
-           w.matchWinnerSquad, w.squadScore[0], w.squadScore[1], w.history.size(), kills, hs, plants, defuses, nades, buys, w.time);
-    for (auto& p : w.players) if (p.active) printf("  %-4s %c K%2d D%2d A%2d HS%2d DMG%5d $%5d acc %.0f%%\n", p.name, p.team == TEAM_ATK ? 'T' : 'D', p.kills, p.deaths, p.assists, p.headshots, p.damage, p.money, p.shotsFiredTotal ? 100.f * p.shotsHitTotal / p.shotsFiredTotal : 0.f);
+    w.lobbyEnd = 0;
+    w.step();
+    ai.reset(w);
+    int lastMin = -1;
+    while (w.phase != PH_OVER && w.time < 60 * 40) {
+        ai.think(w);
+        w.step();
+        w.events.clear();
+        int m = (int)(w.time / 60);
+        if (m != lastMin && m % (getenv("EVERY") ? atoi(getenv("EVERY")) : 3) == 0) {
+            lastMin = m;
+            int hubs[2] = {0, 0}, ext[2] = {0, 0};
+            for (auto& e : w.ents) { if (e.alive && e.type == B_HUB && !e.constructing) hubs[e.team]++; if (e.alive && e.type == B_EXTRACTOR && !e.constructing) ext[e.team]++; }
+            printf("t=%2dmin hubs %d-%d ext %d-%d ents %zu |", m, hubs[0], hubs[1], ext[0], ext[1], w.ents.size());
+            for (int i = 0; i < MAX_PLAYERS; i++) {
+                if (!w.players[i].active) continue;
+                auto& P = w.players[i];
+                Entity& h = w.ents[P.heroId];
+                int army = 0; for (auto& e : w.ents) if (e.alive && e.owner == i && e.kind == K_UNIT && e.type != U_DRONE) army++;
+                printf(" P%d[%s] $%d f%d sup %d/%d dr%d army%d L%d %d/%d/%d up%d%d |", i, unitDef(P.hero).name, P.gold, P.flux, w.supplyUsed(i), w.supplyMax(i),
+                       w.countUnits(i, U_DRONE, false), army, h.level, h.kills, h.deaths, h.assists, P.upgrades[0], P.upgrades[1]);
+            }
+            printf("\n");
+        }
+    }
+    printf("RESULT winner=%d time=%.0fs ents=%zu\n", w.winner, w.time, w.ents.size());
+    for (int i = 0; i < MAX_PLAYERS; i++) if (w.players[i].active) { auto& P = w.players[i]; printf("  P%d crystals %d flux %d produced %d killed %d lost %d apm %.0f\n", i, P.goldEarned, P.fluxEarned, P.unitsProduced, P.unitsKilled, P.unitsLost, P.actions / (w.time / 60)); }
 }
