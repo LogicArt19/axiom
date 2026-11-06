@@ -40,6 +40,8 @@ jobs:
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             echo "AXIOM_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            echo "AXIOM_VERSION=$(tr -d ' \r\n' < VERSION)" >> "$GITHUB_ENV"
           else
             echo "AXIOM_VERSION=0.0.0-dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
           fi
@@ -88,20 +90,37 @@ jobs:
           name: AXIOM-${{ matrix.platform }}
           path: AXIOM-${{ matrix.platform }}.zip
 
+  # Publishes automatically: on a "v*" tag, or on every push to main whose VERSION file
+  # names a version that has no release yet (bump VERSION + push = new update for every launcher)
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: build
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF_NAME#v}"; else V="$(tr -d ' \r\n' < VERSION)"; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]] && gh release view "v$V" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"; echo "Release v$V already exists - nothing to publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/download-artifact@v4
+        if: steps.ver.outputs.skip != 'true'
         with:
           path: artifacts
           merge-multiple: true
       - name: Release notes
+        if: steps.ver.outputs.skip != 'true'
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.ver.outputs.version }}"
           # take the matching section of CHANGELOG.md if present, otherwise a default text
           if [ -f CHANGELOG.md ] && grep -q "^## \[$VERSION\]" CHANGELOG.md; then
             awk -v v="## [$VERSION]" 'index($0,v)==1{f=1;print;next} /^## \[/{if(f)exit} f' CHANGELOG.md > notes.md
@@ -110,7 +129,10 @@ jobs:
             echo "Mise a jour disponible via le launcher." >> notes.md
           fi
       - uses: softprops/action-gh-release@v2
+        if: steps.ver.outputs.skip != 'true'
         with:
-          name: AXIOM ${{ github.ref_name }}
+          tag_name: v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: AXIOM v${{ steps.ver.outputs.version }}
           body_path: notes.md
           files: artifacts/*.zip

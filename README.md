@@ -35,12 +35,9 @@ Le launcher connaît déjà votre dépôt (il est inscrit à la compilation et d
 
 ## 2. Publier une mise à jour
 
-```bash
-# modifiez le code, puis ajoutez une section dans CHANGELOG.md :  ## [1.0.1]
-git commit -am "Equilibrage"
-git tag v1.0.1
-git push && git push origin v1.0.1
-```
+Changez le numéro dans le fichier `VERSION` (ex. `1.0.1`), ajoutez une section `## [1.0.1]` dans
+`CHANGELOG.md`, puis poussez sur `main` : la CI compile et publie la release `v1.0.1` toute seule.
+(Pousser un tag `v1.0.1` fonctionne aussi.)
 La CI publie la release ; au prochain démarrage chaque launcher affiche **METTRE À JOUR**, télécharge le
 paquet de sa plateforme, remplace le dossier `game/` et se met à jour lui-même si besoin.
 Les notes de version du launcher viennent de la section correspondante de `CHANGELOG.md`.
